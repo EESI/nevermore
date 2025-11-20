@@ -1,2 +1,20 @@
-# nevermore
-NEVERMORE is an agentic molecular optimization framework that integrates Firm-DTI representations, Morgan fingerprint perturbations using Nevergrad, and large-scale ligand retrieval from BindingDB and ChEMBL to discover drug-like candidates with improved affinity and ADMET profiles.
+# Nevermore Pipeline
+
+Modular, cached version of the Nevermore notebook that chains data ingest, feature building, optimization, retrieval, visualization, docking, ADMET, and reporting. Each step writes to `nevermore/outputs/<step>/<signature>/` and is skipped automatically if inputs/configs are unchanged.
+
+## Layout
+- `nevermore/configs/default.yaml` — editable defaults for every stage.
+- `nevermore/` — pipeline + step implementations.
+- `nevermore/notebooks/run_nevermore.ipynb` — quick notebook entrypoint.
+
+## Quick start
+```bash
+# from Firm-DTI/Firm-DTI2
+python -m nevermore.cli --config nevermore/configs/default.yaml --up-to retrieval
+```
+Change `--up-to` to run deeper (visualization, docking, admet, report). Outputs are printed with their cache signature.
+
+## Notes
+- Docking and ADMET are disabled by default; flip `enabled: true` in the config to run them.
+- Retrieval reuses previous steps when inputs match. Change any config value or upstream file to force a new signature/output set.
+- The pipeline assumes the Firm-DTI2 repo root contains `data/train.csv` and the checkpoint from the original notebook. Adjust paths in the config if yours differ.

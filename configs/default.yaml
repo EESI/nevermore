@@ -1,0 +1,64 @@
+run_name: nevermore-demo
+paths:
+  repo_root: null           # auto-detected; leave null unless running elsewhere
+  output_root: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/outputs    # writes to <repo>/outputs
+
+data:
+  data_dir: data
+  train_file: train.csv
+  test_file: test.csv
+
+features:
+  morgan_bits: 1024
+  morgan_radius: 2
+  checkpoint: ./output/model_2/trainer2/Firm-D4-prj2/checkpoint.pt
+  batch_size: 64
+  device: null              # "cuda" | "cpu" | null (auto)
+
+optimization:
+  target_affinity: 12.0
+  sample_index: 10
+  protein_features: 0
+  ligand_features: 15
+  allow_protein_adjustments: false
+  allow_ligand_adjustments: true
+  frozen_protein_features: []
+  frozen_ligand_features: []
+  budget: 300
+  regularization: 0.001
+  target_sequence: null     # optional override instead of dataset index
+  baseline_smiles: null     # optional override instead of dataset index
+
+retrieval:
+  max_rel_smiles_len_diff: 0.30
+  max_rel_mw_diff: 0.30
+  max_l1_distance: null
+  top_candidates: 20
+
+visualization:
+  enabled: true
+  max_mols: 40
+  mols_per_row: 6
+  panel_size: [300, 240]
+  id_col: dataset_index
+  out_svg: candidate_ligands_grid.svg
+  out_png: candidate_ligands_grid.png
+
+docking:
+  enabled: false
+  target_key: 3U84
+  receptor_pdbqt: ../3U84.pdbqt
+  out_root: null            # defaults to nevermore/outputs/docking/<signature>
+  exhaustiveness: 32
+  num_modes: 20
+  seed: 42
+  limit: null               # set int to cap ligands
+  center: null              # supply [x, y, z] to override TDC metadata
+  size: [30.0, 30.0, 30.0]
+
+admet:
+  enabled: False
+  keys: [molecular_weight, logP, HIA_Hou, hERG, QED, Lipinski]
+
+report:
+  enabled: true
