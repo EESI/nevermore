@@ -64,7 +64,13 @@ class NevermorePipeline:
         if ingest_res is None:
             raise RuntimeError("Run ingest before features")
         cfg = self.config.features
-        payload = {"morgan_bits": cfg.morgan_bits, "morgan_radius": cfg.morgan_radius}
+        payload = {
+            "protein_encoder": cfg.protein_encoder,
+            "esm_model": cfg.esm_model,
+            "max_token_length": cfg.max_token_length,
+            "morgan_bits": cfg.morgan_bits,
+            "morgan_radius": cfg.morgan_radius,
+        }
         files = {"raw_combined": ingest_res.outputs["raw_combined"]}
         return self.cache.run_step(
             "features",

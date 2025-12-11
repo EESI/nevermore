@@ -14,6 +14,17 @@ python -m nevermore.cli --config nevermore/configs/default.yaml --up-to retrieva
 ```
 Change `--up-to` to run deeper (visualization, docking, admet, report). Outputs are printed with their cache signature.
 
+### Run without notebooks / VS Code
+Everything is scriptable; no notebook required. From the repo root:
+```bash
+# ingest → features → optimization → retrieval
+python -m nevermore.cli --config nevermore/configs/default.yaml --up-to retrieval
+
+# full stack including docking + ADMET (enable them in the config first)
+python -m nevermore.cli --config nevermore/configs/default.yaml --up-to report
+```
+You can edit `nevermore/configs/default.yaml` directly to change the checkpoint, ESM model, or enable docking/ADMET. Cached outputs go to `nevermore/outputs/<step>/<signature>/`.
+
 ## Notes
 - Docking and ADMET are disabled by default; flip `enabled: true` in the config to run them.
 - Retrieval reuses previous steps when inputs match. Change any config value or upstream file to force a new signature/output set.

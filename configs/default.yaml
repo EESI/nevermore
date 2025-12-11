@@ -1,4 +1,4 @@
-run_name: nevermore-demo
+run_name: nevermore-demo2
 paths:
   repo_root: null           # auto-detected; leave null unless running elsewhere
   output_root: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/outputs    # writes to <repo>/outputs
@@ -9,9 +9,12 @@ data:
   test_file: test.csv
 
 features:
-  morgan_bits: 1024
+  protein_encoder: esm       # "esm" to use ESM tokens, "handcrafted" for unigram/bigram counts
+  esm_model: facebook/esm2_t12_35M_UR50D
+  max_token_length: 1500
+  morgan_bits: 4048
   morgan_radius: 2
-  checkpoint: ./output/model_2/trainer2/Firm-D4-prj2/checkpoint.pt
+  checkpoint: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/output/esm_morgan_trainer/esm_morgan_run_morgan_more/checkpoint.pt
   batch_size: 64
   device: null              # "cuda" | "cpu" | null (auto)
 
@@ -45,19 +48,19 @@ visualization:
   out_png: candidate_ligands_grid.png
 
 docking:
-  enabled: false
+  enabled: True
   target_key: 3U84
-  receptor_pdbqt: ../3U84.pdbqt
+  receptor_pdbqt: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/3U84.pdbqt
   out_root: null            # defaults to nevermore/outputs/docking/<signature>
   exhaustiveness: 32
   num_modes: 20
   seed: 42
   limit: null               # set int to cap ligands
-  center: null              # supply [x, y, z] to override TDC metadata
+  center: [15, -63, 1]              # supply [x, y, z] to override TDC metadata
   size: [30.0, 30.0, 30.0]
 
 admet:
-  enabled: False
+  enabled: True
   keys: [molecular_weight, logP, HIA_Hou, hERG, QED, Lipinski]
 
 report:

@@ -43,6 +43,9 @@ class DataConfig:
 
 @dataclass
 class FeatureConfig:
+    protein_encoder: str = "esm"  # "handcrafted" | "esm"
+    esm_model: str = "facebook/esm2_t12_35M_UR50D"
+    max_token_length: int = 1500
     morgan_bits: int = 1024
     morgan_radius: int = 2
     checkpoint: Path = Path("./output/model_2/trainer2/Firm-D4-prj2/checkpoint.pt")

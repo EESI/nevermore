@@ -7,7 +7,7 @@ from typing import Any
 
 
 def ensure_repo_root_on_path(repo_root: Path) -> None:
-    """Add repo_root to sys.path once so imports like trainer2 work."""
+    """Add repo_root to sys.path once so local Firm-DTI modules resolve."""
     repo_root = Path(repo_root).resolve()
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import math
 import shutil
@@ -12,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
+from contextlib import redirect_stdout, redirect_stderr
 from torch.cuda.amp import autocast
 from tqdm import tqdm
 
@@ -24,10 +26,31 @@ from .config import (
     RetrievalConfig,
     VisualizationConfig,
 )
-from trainer2 import ligand_feature_vector, protein_feature_vector, is_kekulizable
+from .Firm_dti import ligand_feature_vector, protein_feature_vector, is_kekulizable
 
 
 StepOutputs = Tuple[Dict[str, Path], Dict[str, Any]]
+
+
+# Suppress noisy libraries that print to stdout/stderr even in non-verbose mode.
+def _silent_run(fn, *args, **kwargs):
+    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+        return fn(*args, **kwargs)
+
+
+# Torch checkpoints may reference original module names ("model", "model2").
+# Install aliases that point to the bundled Firm-DTI model so torch.load can resolve them.
+def _alias_firm_dti_modules() -> None:
+    try:
+        import importlib
+
+        from . import Firm_dti
+
+        sys.modules.setdefault("model", importlib.import_module(".Firm_dti.model", __package__))
+        sys.modules.setdefault("model2", importlib.import_module(".Firm_dti.model", __package__))
+    except Exception:
+        # If aliasing fails, fall through and let torch.load raise a clear error.
+        pass
 
 
 # ------------------------------ ingest ------------------------------ #
@@ -74,8 +97,29 @@ def build_features(cfg: FeatureConfig, step_dir: Path, raw_csv: Path, verbose: b
     if verbose:
         iterable = tqdm(iterable, total=len(filtered), desc="[features] featurizing")
 
+    use_esm = cfg.protein_encoder.lower() == "esm"
+    tokenizer = None
+    max_len = None
+    if use_esm:
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as e:
+            raise RuntimeError("Transformers is required for ESM tokenization") from e
+        tokenizer = AutoTokenizer.from_pretrained(cfg.esm_model)
+        max_len = min(cfg.max_token_length, tokenizer.model_max_length)
+
     for row in iterable:
-        protein_feat_list.append(protein_feature_vector(row.Target))
+        if use_esm:
+            tokens = tokenizer(
+                row.Target,
+                return_tensors="pt",
+                truncation=True,
+                padding="max_length",
+                max_length=max_len,
+            )["input_ids"].squeeze(0).numpy()
+            protein_feat_list.append(tokens.astype(np.int64, copy=False))
+        else:
+            protein_feat_list.append(protein_feature_vector(row.Target))
         ligand_feat_list.append(ligand_feature_vector(row.Drug, cfg.morgan_bits, cfg.morgan_radius))
 
     protein_mat = np.stack(protein_feat_list)
@@ -93,6 +137,7 @@ def build_features(cfg: FeatureConfig, step_dir: Path, raw_csv: Path, verbose: b
         "dropped_rows": len(df) - len(filtered),
         "protein_dim": int(protein_mat.shape[1]),
         "ligand_dim": int(ligand_mat.shape[1]),
+        "protein_encoder": cfg.protein_encoder,
     }
     if verbose:
         print(f"[features] wrote {processed_path}, protein.npy, ligand.npy (kept {len(filtered)} rows)")
@@ -100,17 +145,24 @@ def build_features(cfg: FeatureConfig, step_dir: Path, raw_csv: Path, verbose: b
 
 
 # ------------------------------ optimization ------------------------------ #
-def _load_model(checkpoint: Path, protein_dim: int, ligand_dim: int, device: torch.device):
-    from model2 import FeatureTuner
+def _load_model(checkpoint: Path, protein_dim: int, ligand_dim: int, device: torch.device, feat_cfg: FeatureConfig):
+    from .Firm_dti import FeatureTuner, EsmMorganTuner
 
-    state = torch.load(checkpoint, map_location=device)
+    _alias_firm_dti_modules()
+    # Explicitly allow loading pickled modules (old checkpoints) by opting out of weights_only=True default.
+    state = torch.load(checkpoint, map_location=device, weights_only=False)
+    use_esm = feat_cfg.protein_encoder.lower() == "esm"
+
     if isinstance(state, dict) and "Tuner" in state:
         model = state["Tuner"]
     else:
         state_dict = state.get("model_state_dict", state)
-        hidden_dim = state_dict["protein_proj.weight"].shape[0]
-        rbf_k = state_dict["aff_head.out.weight"].shape[1]
-        model = FeatureTuner(protein_dim=protein_dim, ligand_dim=ligand_dim, hidden_dim=hidden_dim, rbf_k=rbf_k)
+        if use_esm:
+            model = EsmMorganTuner(ligand_dim=ligand_dim, pretrained_model=feat_cfg.esm_model)
+        else:
+            hidden_dim = state_dict["protein_proj.weight"].shape[0]
+            rbf_k = state_dict["aff_head.out.weight"].shape[1]
+            model = FeatureTuner(protein_dim=protein_dim, ligand_dim=ligand_dim, hidden_dim=hidden_dim, rbf_k=rbf_k)
         model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
@@ -141,17 +193,19 @@ def run_optimization(
 
     target_sequence = opt_cfg.target_sequence or processed.loc[opt_cfg.sample_index, "Target"]
     baseline_smiles = opt_cfg.baseline_smiles or processed.loc[opt_cfg.sample_index, "Drug"]
-    base_protein = protein_feature_vector(target_sequence)
+
+    use_esm = feat_cfg.protein_encoder.lower() == "esm"
+    base_protein = protein_mat[opt_cfg.sample_index]
     base_ligand = ligand_feature_vector(baseline_smiles, feat_cfg.morgan_bits, feat_cfg.morgan_radius)
 
     device = torch.device(feat_cfg.device) if feat_cfg.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = _load_model(feat_cfg.checkpoint, protein_mat.shape[1], ligand_mat.shape[1], device)
-    use_amp = device.type == "cuda"
+    model = _load_model(feat_cfg.checkpoint, protein_mat.shape[1], ligand_mat.shape[1], device, feat_cfg)
+    use_amp = device.type == "cuda" and not use_esm
 
-    protein_count = opt_cfg.protein_features if opt_cfg.allow_protein_adjustments else 0
+    protein_count = 0 if use_esm else (opt_cfg.protein_features if opt_cfg.allow_protein_adjustments else 0)
     ligand_count = opt_cfg.ligand_features if opt_cfg.allow_ligand_adjustments else 0
 
-    protein_std = protein_mat.std(axis=0)
+    protein_std = protein_mat.std(axis=0) if protein_count > 0 else np.zeros(0, dtype=np.float32)
     ligand_std = ligand_mat.std(axis=0)
     protein_indices = _select_indices(protein_std, protein_count)
     ligand_indices = _select_indices(ligand_std, ligand_count)
@@ -182,11 +236,19 @@ def run_optimization(
     parametrization = ng.p.Array(init=init).set_bounds(lower=lower, upper=upper)
 
     def score_pair(protein_vec, ligand_vec):
-        protein_tensor = torch.tensor(protein_vec, dtype=torch.float32, device=device)
         ligand_tensor = torch.tensor(ligand_vec, dtype=torch.float32, device=device)
         with torch.no_grad():
-            with autocast(enabled=use_amp):
-                _, _, pred = model.inference(ligand_tensor.unsqueeze(0), protein_tensor.unsqueeze(0))
+            if use_esm:
+                protein_tensor = torch.tensor(protein_vec, dtype=torch.long, device=device)
+                if protein_tensor.dim() == 1:
+                    protein_tensor = protein_tensor.unsqueeze(0)
+                if ligand_tensor.dim() == 1:
+                    ligand_tensor = ligand_tensor.unsqueeze(0)
+                _, _, pred = model.inference(ligand_tensor, protein_tensor)
+            else:
+                protein_tensor = torch.tensor(protein_vec, dtype=torch.float32, device=device)
+                with autocast(enabled=use_amp):
+                    _, _, pred = model.inference(ligand_tensor.unsqueeze(0), protein_tensor.unsqueeze(0))
         return float(pred.item())
 
     def discretize_ligand(vec: np.ndarray) -> np.ndarray:
@@ -229,11 +291,12 @@ def run_optimization(
         {
             "feature_type": ["protein"] * len(protein_indices),
             "feature_index": protein_indices.astype(int),
-            "baseline": base_protein[protein_indices],
-            "new_value": optimized_protein[protein_indices],
+            "baseline": base_protein[protein_indices] if len(protein_indices) else [],
+            "new_value": optimized_protein[protein_indices] if len(protein_indices) else [],
         }
     )
-    protein_summary["adjustment"] = protein_summary["new_value"] - protein_summary["baseline"]
+    if len(protein_indices):
+        protein_summary["adjustment"] = protein_summary["new_value"] - protein_summary["baseline"]
 
     ligand_baseline = discretize_ligand(base_ligand)
     ligand_summary = pd.DataFrame(
@@ -586,8 +649,8 @@ def admet_predictions(cfg: AdmetConfig, step_dir: Path, candidates_csv: Path) ->
     except ImportError as e:
         raise RuntimeError("admet-ai is required for ADMET predictions") from e
 
-    model = ADMETModel()
-    preds = model.predict(df["smiles"].astype(str).tolist())
+    model = _silent_run(ADMETModel)
+    preds = _silent_run(model.predict, df["smiles"].astype(str).tolist())
     if isinstance(preds, pd.DataFrame):
         pred_rows = preds.to_dict(orient="records")
     elif isinstance(preds, (list, tuple)):
