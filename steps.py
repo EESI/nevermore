@@ -212,21 +212,34 @@ def _select_indices(std_array: np.ndarray, count: int) -> np.ndarray:
 
 
 def run_optimization(
-    opt_cfg: OptimizationConfig,
-    feat_cfg: FeatureConfig,
+    opt_cfg: "OptimizationConfig",
+    feat_cfg: "FeatureConfig",
     step_dir: Path,
     processed_csv: Path,
     protein_path: Path,
     ligand_path: Path,
     admet_path: Optional[Path] = None,
-) -> StepOutputs:
+) -> "StepOutputs":
+    """
+    Projection-in-loop optimization:
+      Nevergrad edits a "bucket" fingerprint -> we project it to 1-NN (or top-K NNs) REAL fingerprints
+      -> model affinity is scored on the real fingerprint(s), consistent with ADMET/manifold/retrieval.
+
+    Requires external helpers used in your original code:
+      - ligand_feature_vector(smiles, bits, radius)
+      - _load_model(checkpoint, protein_dim, ligand_dim, device, feat_cfg)
+      - _select_indices(std_vec, count)
+    """
+
     step_dir.mkdir(parents=True, exist_ok=True)
     processed = pd.read_csv(processed_csv)
     protein_mat = np.load(protein_path)
     ligand_mat = np.load(ligand_path)
 
     if opt_cfg.sample_index >= len(processed):
-        raise IndexError(f"sample_index {opt_cfg.sample_index} out of range for processed dataset of size {len(processed)}")
+        raise IndexError(
+            f"sample_index {opt_cfg.sample_index} out of range for processed dataset of size {len(processed)}"
+        )
 
     target_sequence = opt_cfg.target_sequence or processed.loc[opt_cfg.sample_index, "Target"]
     baseline_smiles = opt_cfg.baseline_smiles or processed.loc[opt_cfg.sample_index, "Drug"]
@@ -244,14 +257,16 @@ def run_optimization(
 
     protein_std = protein_mat.std(axis=0) if protein_count > 0 else np.zeros(0, dtype=np.float32)
     ligand_std = ligand_mat.std(axis=0)
+
     protein_indices = _select_indices(protein_std, protein_count)
     ligand_indices = _select_indices(ligand_std, ligand_count)
+
     ligand_weights = np.ones(ligand_mat.shape[1], dtype=np.float32)
     if ligand_count > 0:
-        ligand_weights.fill(0.2)  # downweight untouched buckets
-        ligand_weights[ligand_indices] = 5.0  # emphasize editable buckets
+        ligand_weights.fill(0.2)               # downweight untouched buckets
+        ligand_weights[ligand_indices] = 5.0   # emphasize editable buckets
 
-    # Optional ADMET constraints: load precomputed ADMET table and prep penalty helpers.
+    # ---------------- ADMET constraints ----------------
     admet_array = None
     admet_penalties: List[Dict[str, Any]] = []
     admet_keys: List[str] = []
@@ -259,10 +274,9 @@ def run_optimization(
         admet_df = pd.read_csv(admet_path)
         if "dataset_index" in admet_df.columns:
             admet_df = admet_df.set_index("dataset_index")
-        # Align to processed order to match ligand_mat rows
         admet_df = admet_df.reindex(processed["dataset_index"])
-        # Keep only constraints present in the table
-        constraint_keys = []
+
+        constraint_keys: List[str] = []
         for c in opt_cfg.admet_constraints:
             key = c.get("key")
             if key in admet_df.columns:
@@ -275,10 +289,14 @@ def run_optimization(
                         "weight": float(c.get("weight", 1.0)),
                     }
                 )
+
         if constraint_keys:
             admet_array = admet_df[constraint_keys].to_numpy()
             admet_keys = constraint_keys
 
+    admet_key2idx = {k: i for i, k in enumerate(admet_keys)} if admet_keys else {}
+
+    # ---------------- bounds ----------------
     protein_bounds = np.zeros(protein_count, dtype=np.float32)
     if protein_count > 0:
         protein_bounds = np.where(protein_std[protein_indices] > 0, 2 * protein_std[protein_indices], 1.0).astype(np.float32)
@@ -297,14 +315,15 @@ def run_optimization(
     lower = np.concatenate((-protein_bounds, -ligand_bounds))
     upper = np.concatenate((protein_bounds, ligand_bounds))
 
-    parametrization = None
     try:
         import nevergrad as ng
     except ImportError as e:
         raise RuntimeError("nevergrad is required for optimization") from e
+
     parametrization = ng.p.Array(init=init).set_bounds(lower=lower, upper=upper)
 
-    def score_pair(protein_vec, ligand_vec):
+    # ---------------- model scoring ----------------
+    def score_pair(protein_vec: np.ndarray, ligand_vec: np.ndarray) -> float:
         ligand_tensor = torch.tensor(ligand_vec, dtype=torch.float32, device=device)
         with torch.no_grad():
             if use_esm:
@@ -329,108 +348,162 @@ def run_optimization(
 
     manifold_weight = float(getattr(opt_cfg, "manifold_weight", 0.0) or 0.0)
 
-    def objective(delta):
+    # --------------- Projection-in-loop: fast NN on edited indices ---------------
+    S = ligand_indices.astype(int)
+    nn_k = int(getattr(opt_cfg, "nn_k", 30) or 30) # set opt_cfg.nn_k=8 for top-K projection
+
+    lig_mat_S = ligand_mat[:, S].astype(np.float32, copy=False) if len(S) else None
+    wS = ligand_weights[S].astype(np.float32, copy=False) if len(S) else None
+    base_S = base_ligand[S].astype(np.float32, copy=False) if len(S) else None
+
+    const_dist = None
+    if ligand_count > 0:
+        # constant contribution from unedited dims (speed-up)
+        full = np.sum(np.abs(ligand_mat - base_ligand[None, :]) * ligand_weights[None, :], axis=1).astype(np.float32)
+        edited_baseline = np.sum(np.abs(lig_mat_S - base_S[None, :]) * wS[None, :], axis=1).astype(np.float32)
+        const_dist = full - edited_baseline  # shape (N,)
+
+    def project_neighbors(lig_bucket: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Returns:
+          idxs: (K,) indices of nearest real ligands (K=1 for 1-NN)
+          dist: (N,) weighted L1 distances used (for manifold penalty/logging)
+        """
+        # If no ligand edits, just NN on full vector
+        if ligand_count == 0:
+            dist = np.sum(np.abs(ligand_mat - lig_bucket[None, :]) * ligand_weights[None, :], axis=1).astype(np.float32)
+            idx = int(np.argmin(dist))
+            return np.array([idx], dtype=int), dist
+
+        var = np.sum(np.abs(lig_mat_S - lig_bucket[S][None, :]) * wS[None, :], axis=1).astype(np.float32)
+        dist = var  # if const_dist is None else (const_dist + var)
+
+        K = max(1, min(nn_k, dist.shape[0]))
+        if K == 1:
+            return np.array([int(np.argmin(dist))], dtype=int), dist
+
+        if K == dist.shape[0]:
+            idxs = np.argsort(dist)
+            return idxs.astype(int), dist
+
+        idxs = np.argpartition(dist, K)[:K]
+        idxs = idxs[np.argsort(dist[idxs])]
+        return idxs.astype(int), dist
+    # ---------------------------------------------------------------------------
+
+    def evaluate(delta: np.ndarray) -> Dict[str, Any]:
+        """
+        Evaluate one Nevergrad candidate. Returns a dict with:
+          loss, pred, admet_penalty, manifold_distance, projected_idx,
+          protein_adjusted, ligand_bucket (the edited bucket vector),
+          and optional admet_vals (for logging)
+        """
         delta = np.asarray(delta, dtype=np.float32)
+
         protein_delta = delta[:protein_count]
         ligand_delta = delta[protein_count:]
+
         protein_adjusted = base_protein.copy()
-        ligand_adjusted = base_ligand.copy()
+        ligand_bucket = base_ligand.copy()
+
         if protein_count > 0:
             protein_adjusted[protein_indices] += protein_delta
+
         if ligand_count > 0:
-            ligand_adjusted[ligand_indices] += ligand_delta
-            ligand_adjusted = discretize_ligand(ligand_adjusted)
-        pred = score_pair(protein_adjusted, ligand_adjusted)
-        deviation = pred - opt_cfg.target_affinity
-        regularization = opt_cfg.regularization * np.sum(np.abs(delta))
+            ligand_bucket[ligand_indices] += ligand_delta
+            ligand_bucket = discretize_ligand(ligand_bucket)  # for smoother NG you can try disabling this
 
-        admet_penalty = 0.0
-        if admet_array is not None:
-            # Use nearest neighbor ligand to proxy ADMET for this adjusted fingerprint.
-            diff = np.abs(ligand_mat - ligand_adjusted) * ligand_weights
-            nearest_idx = int(np.argmin(np.sum(diff, axis=1)))
-            admet_vec = admet_array[nearest_idx]
-            for pen in admet_penalties:
-                key_idx = admet_keys.index(pen["key"])
-                val = admet_vec[key_idx]
-                if np.isnan(val):
-                    continue
-                if pen["min"] is not None and val < pen["min"]:
-                    admet_penalty += pen["weight"] * (pen["min"] - val) ** 2
-                if pen["max"] is not None and val > pen["max"]:
-                    admet_penalty += pen["weight"] * (val - pen["max"]) ** 2
+        idxs, dist = project_neighbors(ligand_bucket)
 
-        manifold_penalty = 0.0
-        if manifold_weight > 0.0:
-            diff = np.abs(ligand_mat - ligand_adjusted) * ligand_weights
-            manifold_penalty = manifold_weight * float(np.min(np.sum(diff, axis=1)))
+        best = {
+            "loss": float("inf"),
+            "pred": None,
+            "admet_penalty": 0.0,
+            "manifold_distance": None,
+            "projected_idx": None,
+            "admet_vals": None,
+        }
 
-        return deviation**2 + admet_penalty + manifold_penalty
+        for idx in idxs:
+            ligand_proj = ligand_mat[idx]  # REAL fingerprint
+
+            pred = score_pair(protein_adjusted, ligand_proj)
+            deviation = pred - opt_cfg.target_affinity
+
+            admet_penalty = 0.0
+            admet_vals = None
+            if admet_array is not None:
+                admet_vec = admet_array[idx]
+                admet_vals = {k: (float(admet_vec[i]) if not np.isnan(admet_vec[i]) else np.nan) for i, k in enumerate(admet_keys)}
+                for pen in admet_penalties:
+                    j = admet_key2idx[pen["key"]]
+                    val = admet_vec[j]
+                    if np.isnan(val):
+                        continue
+                    if pen["min"] is not None and val < pen["min"]:
+                        admet_penalty += pen["weight"] * (pen["min"] - val) ** 2
+                    if pen["max"] is not None and val > pen["max"]:
+                        admet_penalty += pen["weight"] * (val - pen["max"]) ** 2
+
+            manifold_distance = float(dist[idx])  # distance to this projected ligand
+            manifold_penalty = manifold_weight * manifold_distance if manifold_weight > 0.0 else 0.0
+
+            loss = deviation**2 + admet_penalty + manifold_penalty
+
+            if loss < best["loss"]:
+                best.update(
+                    {
+                        "loss": float(loss),
+                        "pred": float(pred),
+                        "admet_penalty": float(admet_penalty),
+                        "manifold_distance": manifold_distance if manifold_weight > 0.0 else None,
+                        "projected_idx": int(idx),
+                        "admet_vals": admet_vals,
+                    }
+                )
+
+        return {
+            **best,
+            "protein_adjusted": protein_adjusted,
+            "ligand_bucket": ligand_bucket,
+            "protein_delta": protein_delta,
+            "ligand_delta": ligand_delta,
+        }
 
     optimizer = ng.optimizers.NGOpt(parametrization=parametrization, budget=opt_cfg.budget)
     trace: List[Dict[str, Any]] = []
 
     def logging_objective(delta):
-        loss = objective(delta)
-        # Recompute pieces for logging without side effects.
-        delta = np.asarray(delta, dtype=np.float32)
-        protein_delta = delta[:protein_count]
-        ligand_delta = delta[protein_count:]
-        protein_adjusted = base_protein.copy()
-        ligand_adjusted = base_ligand.copy()
-        if protein_count > 0:
-            protein_adjusted[protein_indices] += protein_delta
-        if ligand_count > 0:
-            ligand_adjusted[ligand_indices] += ligand_delta
-            ligand_adjusted = discretize_ligand(ligand_adjusted)
-        pred = score_pair(protein_adjusted, ligand_adjusted)
-
-        # ADMET snapshot
-        admet_vals = None
-        diff = np.abs(ligand_mat - ligand_adjusted) * ligand_weights
-        manifold_distance = float(np.min(np.sum(diff, axis=1))) if manifold_weight > 0 else None
-        admet_penalty_local = 0.0
-        if admet_array is not None:
-            nearest_idx = int(np.argmin(np.sum(diff, axis=1)))
-            admet_vec = admet_array[nearest_idx]
-            admet_vals = {k: float(admet_vec[i]) if not np.isnan(admet_vec[i]) else np.nan for i, k in enumerate(admet_keys)}
-            for pen in admet_penalties:
-                key_idx = admet_keys.index(pen["key"])
-                val = admet_vec[key_idx]
-                if np.isnan(val):
-                    continue
-                if pen["min"] is not None and val < pen["min"]:
-                    admet_penalty_local += pen["weight"] * (pen["min"] - val) ** 2
-                if pen["max"] is not None and val > pen["max"]:
-                    admet_penalty_local += pen["weight"] * (val - pen["max"]) ** 2
+        out = evaluate(delta)
 
         trace.append(
             {
                 "iter": len(trace),
-                "predicted_affinity": float(pred),
-                "loss": float(loss),
-                "admet_penalty": float(admet_penalty_local),
-                "protein_delta_L1": float(np.sum(np.abs(protein_delta))) if protein_count > 0 else 0.0,
-                "ligand_delta_L1": float(np.sum(np.abs(ligand_delta))) if ligand_count > 0 else 0.0,
-                "ligand_counts": json.dumps(ligand_adjusted[ligand_indices].astype(int).tolist()) if ligand_count > 0 else None,
-                "admet": json.dumps(admet_vals) if admet_vals is not None else None,
-                "manifold_distance": manifold_distance,
+                "predicted_affinity": float(out["pred"]),
+                "loss": float(out["loss"]),
+                "admet_penalty": float(out["admet_penalty"]),
+                "protein_delta_L1": float(np.sum(np.abs(out["protein_delta"]))) if protein_count > 0 else 0.0,
+                "ligand_delta_L1": float(np.sum(np.abs(out["ligand_delta"]))) if ligand_count > 0 else 0.0,
+                "ligand_counts": json.dumps(out["ligand_bucket"][ligand_indices].astype(int).tolist()) if ligand_count > 0 else None,
+                "projected_idx": int(out["projected_idx"]) if out["projected_idx"] is not None else None,
+                "admet": json.dumps(out["admet_vals"]) if out["admet_vals"] is not None else None,
+                "manifold_distance": out["manifold_distance"],
             }
         )
-        return loss
+        return out["loss"]
 
     recommendation = optimizer.minimize(logging_objective)
     best_delta = np.asarray(recommendation.value, dtype=np.float32)
 
-    optimized_protein = base_protein.copy()
-    optimized_ligand = base_ligand.copy()
-    if protein_count > 0:
-        optimized_protein[protein_indices] += best_delta[:protein_count]
-    if ligand_count > 0:
-        optimized_ligand[ligand_indices] += best_delta[protein_count:]
-        optimized_ligand = discretize_ligand(optimized_ligand)
-    optimized_affinity = score_pair(optimized_protein, optimized_ligand)
+    # Final evaluation (consistent)
+    final = evaluate(best_delta)
 
+    optimized_protein = final["protein_adjusted"]
+    optimized_bucket = final["ligand_bucket"]  # bucket target vector (edited fingerprint)
+    projected_idx = final["projected_idx"]
+    optimized_affinity = float(final["pred"])
+
+    # summaries
     protein_summary = pd.DataFrame(
         {
             "feature_type": ["protein"] * len(protein_indices),
@@ -448,7 +521,7 @@ def run_optimization(
             "feature_type": ["ligand"] * len(ligand_indices),
             "feature_index": ligand_indices.astype(int),
             "baseline": ligand_baseline[ligand_indices].astype(int),
-            "new_value": optimized_ligand[ligand_indices].astype(int),
+            "new_value": optimized_bucket[ligand_indices].astype(int),
         }
     )
     ligand_summary["adjustment"] = ligand_summary["new_value"] - ligand_summary["baseline"]
@@ -466,16 +539,19 @@ def run_optimization(
     except Exception:
         trace_path = None
 
+    # Manifest: includes both the BUCKET target and the PROJECTED real ligand index
     manifest = {
-        "baseline_affinity": baseline_affinity,
-        "optimized_affinity": optimized_affinity,
+        "baseline_affinity": float(baseline_affinity),
+        "optimized_affinity": float(optimized_affinity),
         "sample_index": int(opt_cfg.sample_index),
         "target_sequence": target_sequence,
         "baseline_smiles": baseline_smiles,
         "ligand_indices": ligand_indices.astype(int).tolist(),
         "target_counts": ligand_summary.sort_values("feature_index")["new_value"].astype(int).tolist(),
         "ligand_adjustments": ligand_adjustments,
-        "manifold_weight": manifold_weight,
+        "manifold_weight": float(manifold_weight),
+        "nn_k": int(nn_k),
+        "projected_neighbor_index": int(projected_idx) if projected_idx is not None else None,
     }
     (step_dir / "target_manifest.json").write_text(json.dumps(manifest, indent=2))
 
@@ -484,6 +560,281 @@ def run_optimization(
     if trace_path:
         outputs["trace"] = trace_path
     return outputs, details
+
+
+
+# def run_optimization(
+#     opt_cfg: OptimizationConfig,
+#     feat_cfg: FeatureConfig,
+#     step_dir: Path,
+#     processed_csv: Path,
+#     protein_path: Path,
+#     ligand_path: Path,
+#     admet_path: Optional[Path] = None,
+# ) -> StepOutputs:
+#     step_dir.mkdir(parents=True, exist_ok=True)
+#     processed = pd.read_csv(processed_csv)
+#     protein_mat = np.load(protein_path)
+#     ligand_mat = np.load(ligand_path)
+
+#     if opt_cfg.sample_index >= len(processed):
+#         raise IndexError(f"sample_index {opt_cfg.sample_index} out of range for processed dataset of size {len(processed)}")
+
+#     target_sequence = opt_cfg.target_sequence or processed.loc[opt_cfg.sample_index, "Target"]
+#     baseline_smiles = opt_cfg.baseline_smiles or processed.loc[opt_cfg.sample_index, "Drug"]
+
+#     use_esm = feat_cfg.protein_encoder.lower() == "esm"
+#     base_protein = protein_mat[opt_cfg.sample_index]
+#     base_ligand = ligand_feature_vector(baseline_smiles, feat_cfg.morgan_bits, feat_cfg.morgan_radius)
+
+#     device = torch.device(feat_cfg.device) if feat_cfg.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     model = _load_model(feat_cfg.checkpoint, protein_mat.shape[1], ligand_mat.shape[1], device, feat_cfg)
+#     use_amp = device.type == "cuda" and not use_esm
+
+#     protein_count = 0 if use_esm else (opt_cfg.protein_features if opt_cfg.allow_protein_adjustments else 0)
+#     ligand_count = opt_cfg.ligand_features if opt_cfg.allow_ligand_adjustments else 0
+
+#     protein_std = protein_mat.std(axis=0) if protein_count > 0 else np.zeros(0, dtype=np.float32)
+#     ligand_std = ligand_mat.std(axis=0)
+#     protein_indices = _select_indices(protein_std, protein_count)
+#     ligand_indices = _select_indices(ligand_std, ligand_count)
+#     ligand_weights = np.ones(ligand_mat.shape[1], dtype=np.float32)
+#     if ligand_count > 0:
+#         ligand_weights.fill(0.2)  # downweight untouched buckets
+#         ligand_weights[ligand_indices] = 5.0  # emphasize editable buckets
+
+#     # Optional ADMET constraints: load precomputed ADMET table and prep penalty helpers.
+#     admet_array = None
+#     admet_penalties: List[Dict[str, Any]] = []
+#     admet_keys: List[str] = []
+#     if admet_path and opt_cfg.admet_constraints:
+#         admet_df = pd.read_csv(admet_path)
+#         if "dataset_index" in admet_df.columns:
+#             admet_df = admet_df.set_index("dataset_index")
+#         # Align to processed order to match ligand_mat rows
+#         admet_df = admet_df.reindex(processed["dataset_index"])
+#         # Keep only constraints present in the table
+#         constraint_keys = []
+#         for c in opt_cfg.admet_constraints:
+#             key = c.get("key")
+#             if key in admet_df.columns:
+#                 constraint_keys.append(key)
+#                 admet_penalties.append(
+#                     {
+#                         "key": key,
+#                         "min": c.get("min"),
+#                         "max": c.get("max"),
+#                         "weight": float(c.get("weight", 1.0)),
+#                     }
+#                 )
+#         if constraint_keys:
+#             admet_array = admet_df[constraint_keys].to_numpy()
+#             admet_keys = constraint_keys
+
+#     protein_bounds = np.zeros(protein_count, dtype=np.float32)
+#     if protein_count > 0:
+#         protein_bounds = np.where(protein_std[protein_indices] > 0, 2 * protein_std[protein_indices], 1.0).astype(np.float32)
+#         if opt_cfg.frozen_protein_features:
+#             frozen_mask = np.isin(protein_indices, np.array(opt_cfg.frozen_protein_features, dtype=int))
+#             protein_bounds[frozen_mask] = 0.0
+
+#     ligand_bounds = np.zeros(ligand_count, dtype=np.float32)
+#     if ligand_count > 0:
+#         ligand_bounds = np.where(ligand_std[ligand_indices] > 0, 2 * ligand_std[ligand_indices], 1.0).astype(np.float32)
+#         if opt_cfg.frozen_ligand_features:
+#             frozen_mask = np.isin(ligand_indices, np.array(opt_cfg.frozen_ligand_features, dtype=int))
+#             ligand_bounds[frozen_mask] = 0.0
+
+#     init = np.zeros(protein_count + ligand_count, dtype=float)
+#     lower = np.concatenate((-protein_bounds, -ligand_bounds))
+#     upper = np.concatenate((protein_bounds, ligand_bounds))
+
+#     parametrization = None
+#     try:
+#         import nevergrad as ng
+#     except ImportError as e:
+#         raise RuntimeError("nevergrad is required for optimization") from e
+#     parametrization = ng.p.Array(init=init).set_bounds(lower=lower, upper=upper)
+
+#     def score_pair(protein_vec, ligand_vec):
+#         ligand_tensor = torch.tensor(ligand_vec, dtype=torch.float32, device=device)
+#         with torch.no_grad():
+#             if use_esm:
+#                 protein_tensor = torch.tensor(protein_vec, dtype=torch.long, device=device)
+#                 if protein_tensor.dim() == 1:
+#                     protein_tensor = protein_tensor.unsqueeze(0)
+#                 if ligand_tensor.dim() == 1:
+#                     ligand_tensor = ligand_tensor.unsqueeze(0)
+#                 _, _, pred = model.inference(ligand_tensor, protein_tensor)
+#             else:
+#                 protein_tensor = torch.tensor(protein_vec, dtype=torch.float32, device=device)
+#                 with autocast(enabled=use_amp):
+#                     _, _, pred = model.inference(ligand_tensor.unsqueeze(0), protein_tensor.unsqueeze(0))
+#         return float(pred.item())
+
+#     def discretize_ligand(vec: np.ndarray) -> np.ndarray:
+#         rounded = np.rint(vec).astype(np.float32, copy=False)
+#         np.clip(rounded, 0.0, None, out=rounded)
+#         return rounded
+
+#     baseline_affinity = score_pair(base_protein, base_ligand)
+
+#     manifold_weight = float(getattr(opt_cfg, "manifold_weight", 0.0) or 0.0)
+
+#     def objective(delta):
+#         delta = np.asarray(delta, dtype=np.float32)
+#         protein_delta = delta[:protein_count]
+#         ligand_delta = delta[protein_count:]
+#         protein_adjusted = base_protein.copy()
+#         ligand_adjusted = base_ligand.copy()
+#         if protein_count > 0:
+#             protein_adjusted[protein_indices] += protein_delta
+#         if ligand_count > 0:
+#             ligand_adjusted[ligand_indices] += ligand_delta
+#             ligand_adjusted = discretize_ligand(ligand_adjusted)
+#         pred = score_pair(protein_adjusted, ligand_adjusted)
+#         deviation = pred - opt_cfg.target_affinity
+
+#         admet_penalty = 0.0
+#         if admet_array is not None:
+#             # Use nearest neighbor ligand to proxy ADMET for this adjusted fingerprint.
+#             diff = np.abs(ligand_mat - ligand_adjusted) * ligand_weights
+#             nearest_idx = int(np.argmin(np.sum(diff, axis=1)))
+#             admet_vec = admet_array[nearest_idx]
+#             for pen in admet_penalties:
+#                 key_idx = admet_keys.index(pen["key"])
+#                 val = admet_vec[key_idx]
+#                 if np.isnan(val):
+#                     continue
+#                 if pen["min"] is not None and val < pen["min"]:
+#                     admet_penalty += pen["weight"] * (pen["min"] - val) ** 2
+#                 if pen["max"] is not None and val > pen["max"]:
+#                     admet_penalty += pen["weight"] * (val - pen["max"]) ** 2
+
+#         manifold_penalty = 0.0
+#         if manifold_weight > 0.0:
+#             diff = np.abs(ligand_mat - ligand_adjusted) * ligand_weights
+#             manifold_penalty = manifold_weight * float(np.min(np.sum(diff, axis=1)))
+
+#         return deviation**2 + admet_penalty + manifold_penalty
+
+#     optimizer = ng.optimizers.NGOpt(parametrization=parametrization, budget=opt_cfg.budget)
+#     trace: List[Dict[str, Any]] = []
+
+#     def logging_objective(delta):
+#         loss = objective(delta)
+#         # Recompute pieces for logging without side effects.
+#         delta = np.asarray(delta, dtype=np.float32)
+#         protein_delta = delta[:protein_count]
+#         ligand_delta = delta[protein_count:]
+#         protein_adjusted = base_protein.copy()
+#         ligand_adjusted = base_ligand.copy()
+#         if protein_count > 0:
+#             protein_adjusted[protein_indices] += protein_delta
+#         if ligand_count > 0:
+#             ligand_adjusted[ligand_indices] += ligand_delta
+#             ligand_adjusted = discretize_ligand(ligand_adjusted)
+#         pred = score_pair(protein_adjusted, ligand_adjusted)
+
+#         # ADMET snapshot
+#         admet_vals = None
+#         diff = np.abs(ligand_mat - ligand_adjusted) * ligand_weights
+#         manifold_distance = float(np.min(np.sum(diff, axis=1))) if manifold_weight > 0 else None
+#         admet_penalty_local = 0.0
+#         if admet_array is not None:
+#             nearest_idx = int(np.argmin(np.sum(diff, axis=1)))
+#             admet_vec = admet_array[nearest_idx]
+#             admet_vals = {k: float(admet_vec[i]) if not np.isnan(admet_vec[i]) else np.nan for i, k in enumerate(admet_keys)}
+#             for pen in admet_penalties:
+#                 key_idx = admet_keys.index(pen["key"])
+#                 val = admet_vec[key_idx]
+#                 if np.isnan(val):
+#                     continue
+#                 if pen["min"] is not None and val < pen["min"]:
+#                     admet_penalty_local += pen["weight"] * (pen["min"] - val) ** 2
+#                 if pen["max"] is not None and val > pen["max"]:
+#                     admet_penalty_local += pen["weight"] * (val - pen["max"]) ** 2
+
+#         trace.append(
+#             {
+#                 "iter": len(trace),
+#                 "predicted_affinity": float(pred),
+#                 "loss": float(loss),
+#                 "admet_penalty": float(admet_penalty_local),
+#                 "protein_delta_L1": float(np.sum(np.abs(protein_delta))) if protein_count > 0 else 0.0,
+#                 "ligand_delta_L1": float(np.sum(np.abs(ligand_delta))) if ligand_count > 0 else 0.0,
+#                 "ligand_counts": json.dumps(ligand_adjusted[ligand_indices].astype(int).tolist()) if ligand_count > 0 else None,
+#                 "admet": json.dumps(admet_vals) if admet_vals is not None else None,
+#                 "manifold_distance": manifold_distance,
+#             }
+#         )
+#         return loss
+
+#     recommendation = optimizer.minimize(logging_objective)
+#     best_delta = np.asarray(recommendation.value, dtype=np.float32)
+
+#     optimized_protein = base_protein.copy()
+#     optimized_ligand = base_ligand.copy()
+#     if protein_count > 0:
+#         optimized_protein[protein_indices] += best_delta[:protein_count]
+#     if ligand_count > 0:
+#         optimized_ligand[ligand_indices] += best_delta[protein_count:]
+#         optimized_ligand = discretize_ligand(optimized_ligand)
+#     optimized_affinity = score_pair(optimized_protein, optimized_ligand)
+
+#     protein_summary = pd.DataFrame(
+#         {
+#             "feature_type": ["protein"] * len(protein_indices),
+#             "feature_index": protein_indices.astype(int),
+#             "baseline": base_protein[protein_indices] if len(protein_indices) else [],
+#             "new_value": optimized_protein[protein_indices] if len(protein_indices) else [],
+#         }
+#     )
+#     if len(protein_indices):
+#         protein_summary["adjustment"] = protein_summary["new_value"] - protein_summary["baseline"]
+
+#     ligand_baseline = discretize_ligand(base_ligand)
+#     ligand_summary = pd.DataFrame(
+#         {
+#             "feature_type": ["ligand"] * len(ligand_indices),
+#             "feature_index": ligand_indices.astype(int),
+#             "baseline": ligand_baseline[ligand_indices].astype(int),
+#             "new_value": optimized_ligand[ligand_indices].astype(int),
+#         }
+#     )
+#     ligand_summary["adjustment"] = ligand_summary["new_value"] - ligand_summary["baseline"]
+#     ligand_adjustments = ligand_summary.sort_values("feature_index")["adjustment"].astype(int).tolist()
+
+#     summary_df = pd.concat([protein_summary, ligand_summary], ignore_index=True)
+#     summary_df["abs_adjustment"] = summary_df["adjustment"].abs()
+
+#     summary_path = step_dir / "optimization_summary.csv"
+#     summary_df.to_csv(summary_path, index=False)
+
+#     trace_path = step_dir / "optimization_trace.csv"
+#     try:
+#         pd.DataFrame(trace).to_csv(trace_path, index=False)
+#     except Exception:
+#         trace_path = None
+
+#     manifest = {
+#         "baseline_affinity": baseline_affinity,
+#         "optimized_affinity": optimized_affinity,
+#         "sample_index": int(opt_cfg.sample_index),
+#         "target_sequence": target_sequence,
+#         "baseline_smiles": baseline_smiles,
+#         "ligand_indices": ligand_indices.astype(int).tolist(),
+#         "target_counts": ligand_summary.sort_values("feature_index")["new_value"].astype(int).tolist(),
+#         "ligand_adjustments": ligand_adjustments,
+#         "manifold_weight": manifold_weight,
+#     }
+#     (step_dir / "target_manifest.json").write_text(json.dumps(manifest, indent=2))
+
+#     details = manifest | {"protein_indices": protein_indices.astype(int).tolist()}
+#     outputs = {"summary": summary_path, "manifest": step_dir / "target_manifest.json"}
+#     if trace_path:
+#         outputs["trace"] = trace_path
+#     return outputs, details
 
 
 # ------------------------------ retrieval ------------------------------ #
