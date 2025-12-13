@@ -51,6 +51,10 @@ class FeatureConfig:
     checkpoint: Path = Path("./output/model_2/trainer2/Firm-D4-prj2/checkpoint.pt")
     batch_size: int = 64
     device: Optional[str] = None  # "cuda", "cpu", or None for auto
+    admet_in_features: bool = False
+    admet_keys: List[str] = field(
+        default_factory=lambda: ["molecular_weight", "logP", "HIA_Hou", "hERG", "QED", "Lipinski"]
+    )
 
 
 @dataclass
@@ -65,8 +69,11 @@ class OptimizationConfig:
     frozen_ligand_features: List[int] = field(default_factory=list)
     budget: int = 300
     regularization: float = 0.001
+    manifold_weight: float = 0.0  # weight for dataset-manifold proximity penalty
     target_sequence: Optional[str] = None
     baseline_smiles: Optional[str] = None
+    # Optional ADMET penalties applied during optimization. Each entry: {"key": str, "min": float?, "max": float?, "weight": float}
+    admet_constraints: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

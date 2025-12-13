@@ -125,6 +125,34 @@ def build_features(cfg: FeatureConfig, step_dir: Path, raw_csv: Path, verbose: b
     protein_mat = np.stack(protein_feat_list)
     ligand_mat = np.stack(ligand_feat_list)
 
+    admet_path: Optional[Path] = None
+    admet_rows = 0
+    if getattr(cfg, "admet_in_features", False) and len(filtered):
+        try:
+            from admet_ai import ADMETModel
+        except ImportError as e:
+            raise RuntimeError("admet-ai is required for ADMET feature computation") from e
+
+        model = _silent_run(ADMETModel)
+        smiles_list = filtered["smiles"].astype(str).tolist()
+        preds = _silent_run(model.predict, smiles_list)
+        if isinstance(preds, pd.DataFrame):
+            pred_df = preds.reset_index(drop=True)
+        elif isinstance(preds, (list, tuple)):
+            pred_df = pd.DataFrame(preds)
+        else:
+            raise TypeError(f"Unexpected ADMET predictions type: {type(preds)}")
+        if len(pred_df) != len(filtered):
+            raise RuntimeError(f"ADMET prediction count mismatch: got {len(pred_df)} vs {len(filtered)} rows")
+
+        admet_cols = list(getattr(cfg, "admet_keys", []) or pred_df.columns.tolist())
+        for col in admet_cols:
+            filtered[col] = pred_df.get(col)
+        admet_export = pd.concat([filtered[["dataset_index", "smiles"]], pred_df[admet_cols]], axis=1)
+        admet_path = step_dir / "admet_features.csv"
+        admet_export.to_csv(admet_path, index=False)
+        admet_rows = len(admet_export)
+
     processed_path = step_dir / "processed.csv"
     protein_path = step_dir / "protein.npy"
     ligand_path = step_dir / "ligand.npy"
@@ -139,9 +167,17 @@ def build_features(cfg: FeatureConfig, step_dir: Path, raw_csv: Path, verbose: b
         "ligand_dim": int(ligand_mat.shape[1]),
         "protein_encoder": cfg.protein_encoder,
     }
+    if admet_path:
+        details["admet_rows"] = admet_rows
+        details["admet_keys"] = admet_cols
     if verbose:
         print(f"[features] wrote {processed_path}, protein.npy, ligand.npy (kept {len(filtered)} rows)")
-    return {"processed": processed_path, "protein": protein_path, "ligand": ligand_path}, details
+        if admet_path:
+            print(f"[features] ADMET predictions -> {admet_path}")
+    outputs = {"processed": processed_path, "protein": protein_path, "ligand": ligand_path}
+    if admet_path:
+        outputs["admet"] = admet_path
+    return outputs, details
 
 
 # ------------------------------ optimization ------------------------------ #
@@ -182,6 +218,7 @@ def run_optimization(
     processed_csv: Path,
     protein_path: Path,
     ligand_path: Path,
+    admet_path: Optional[Path] = None,
 ) -> StepOutputs:
     step_dir.mkdir(parents=True, exist_ok=True)
     processed = pd.read_csv(processed_csv)
@@ -209,6 +246,38 @@ def run_optimization(
     ligand_std = ligand_mat.std(axis=0)
     protein_indices = _select_indices(protein_std, protein_count)
     ligand_indices = _select_indices(ligand_std, ligand_count)
+    ligand_weights = np.ones(ligand_mat.shape[1], dtype=np.float32)
+    if ligand_count > 0:
+        ligand_weights.fill(0.2)  # downweight untouched buckets
+        ligand_weights[ligand_indices] = 5.0  # emphasize editable buckets
+
+    # Optional ADMET constraints: load precomputed ADMET table and prep penalty helpers.
+    admet_array = None
+    admet_penalties: List[Dict[str, Any]] = []
+    admet_keys: List[str] = []
+    if admet_path and opt_cfg.admet_constraints:
+        admet_df = pd.read_csv(admet_path)
+        if "dataset_index" in admet_df.columns:
+            admet_df = admet_df.set_index("dataset_index")
+        # Align to processed order to match ligand_mat rows
+        admet_df = admet_df.reindex(processed["dataset_index"])
+        # Keep only constraints present in the table
+        constraint_keys = []
+        for c in opt_cfg.admet_constraints:
+            key = c.get("key")
+            if key in admet_df.columns:
+                constraint_keys.append(key)
+                admet_penalties.append(
+                    {
+                        "key": key,
+                        "min": c.get("min"),
+                        "max": c.get("max"),
+                        "weight": float(c.get("weight", 1.0)),
+                    }
+                )
+        if constraint_keys:
+            admet_array = admet_df[constraint_keys].to_numpy()
+            admet_keys = constraint_keys
 
     protein_bounds = np.zeros(protein_count, dtype=np.float32)
     if protein_count > 0:
@@ -258,6 +327,8 @@ def run_optimization(
 
     baseline_affinity = score_pair(base_protein, base_ligand)
 
+    manifold_weight = float(getattr(opt_cfg, "manifold_weight", 0.0) or 0.0)
+
     def objective(delta):
         delta = np.asarray(delta, dtype=np.float32)
         protein_delta = delta[:protein_count]
@@ -272,10 +343,83 @@ def run_optimization(
         pred = score_pair(protein_adjusted, ligand_adjusted)
         deviation = pred - opt_cfg.target_affinity
         regularization = opt_cfg.regularization * np.sum(np.abs(delta))
-        return deviation**2 + regularization
+
+        admet_penalty = 0.0
+        if admet_array is not None:
+            # Use nearest neighbor ligand to proxy ADMET for this adjusted fingerprint.
+            diff = np.abs(ligand_mat - ligand_adjusted) * ligand_weights
+            nearest_idx = int(np.argmin(np.sum(diff, axis=1)))
+            admet_vec = admet_array[nearest_idx]
+            for pen in admet_penalties:
+                key_idx = admet_keys.index(pen["key"])
+                val = admet_vec[key_idx]
+                if np.isnan(val):
+                    continue
+                if pen["min"] is not None and val < pen["min"]:
+                    admet_penalty += pen["weight"] * (pen["min"] - val) ** 2
+                if pen["max"] is not None and val > pen["max"]:
+                    admet_penalty += pen["weight"] * (val - pen["max"]) ** 2
+
+        manifold_penalty = 0.0
+        if manifold_weight > 0.0:
+            diff = np.abs(ligand_mat - ligand_adjusted) * ligand_weights
+            manifold_penalty = manifold_weight * float(np.min(np.sum(diff, axis=1)))
+
+        return deviation**2 + admet_penalty + manifold_penalty
 
     optimizer = ng.optimizers.NGOpt(parametrization=parametrization, budget=opt_cfg.budget)
-    recommendation = optimizer.minimize(objective)
+    trace: List[Dict[str, Any]] = []
+
+    def logging_objective(delta):
+        loss = objective(delta)
+        # Recompute pieces for logging without side effects.
+        delta = np.asarray(delta, dtype=np.float32)
+        protein_delta = delta[:protein_count]
+        ligand_delta = delta[protein_count:]
+        protein_adjusted = base_protein.copy()
+        ligand_adjusted = base_ligand.copy()
+        if protein_count > 0:
+            protein_adjusted[protein_indices] += protein_delta
+        if ligand_count > 0:
+            ligand_adjusted[ligand_indices] += ligand_delta
+            ligand_adjusted = discretize_ligand(ligand_adjusted)
+        pred = score_pair(protein_adjusted, ligand_adjusted)
+
+        # ADMET snapshot
+        admet_vals = None
+        diff = np.abs(ligand_mat - ligand_adjusted) * ligand_weights
+        manifold_distance = float(np.min(np.sum(diff, axis=1))) if manifold_weight > 0 else None
+        admet_penalty_local = 0.0
+        if admet_array is not None:
+            nearest_idx = int(np.argmin(np.sum(diff, axis=1)))
+            admet_vec = admet_array[nearest_idx]
+            admet_vals = {k: float(admet_vec[i]) if not np.isnan(admet_vec[i]) else np.nan for i, k in enumerate(admet_keys)}
+            for pen in admet_penalties:
+                key_idx = admet_keys.index(pen["key"])
+                val = admet_vec[key_idx]
+                if np.isnan(val):
+                    continue
+                if pen["min"] is not None and val < pen["min"]:
+                    admet_penalty_local += pen["weight"] * (pen["min"] - val) ** 2
+                if pen["max"] is not None and val > pen["max"]:
+                    admet_penalty_local += pen["weight"] * (val - pen["max"]) ** 2
+
+        trace.append(
+            {
+                "iter": len(trace),
+                "predicted_affinity": float(pred),
+                "loss": float(loss),
+                "admet_penalty": float(admet_penalty_local),
+                "protein_delta_L1": float(np.sum(np.abs(protein_delta))) if protein_count > 0 else 0.0,
+                "ligand_delta_L1": float(np.sum(np.abs(ligand_delta))) if ligand_count > 0 else 0.0,
+                "ligand_counts": json.dumps(ligand_adjusted[ligand_indices].astype(int).tolist()) if ligand_count > 0 else None,
+                "admet": json.dumps(admet_vals) if admet_vals is not None else None,
+                "manifold_distance": manifold_distance,
+            }
+        )
+        return loss
+
+    recommendation = optimizer.minimize(logging_objective)
     best_delta = np.asarray(recommendation.value, dtype=np.float32)
 
     optimized_protein = base_protein.copy()
@@ -308,12 +452,19 @@ def run_optimization(
         }
     )
     ligand_summary["adjustment"] = ligand_summary["new_value"] - ligand_summary["baseline"]
+    ligand_adjustments = ligand_summary.sort_values("feature_index")["adjustment"].astype(int).tolist()
 
     summary_df = pd.concat([protein_summary, ligand_summary], ignore_index=True)
     summary_df["abs_adjustment"] = summary_df["adjustment"].abs()
 
     summary_path = step_dir / "optimization_summary.csv"
     summary_df.to_csv(summary_path, index=False)
+
+    trace_path = step_dir / "optimization_trace.csv"
+    try:
+        pd.DataFrame(trace).to_csv(trace_path, index=False)
+    except Exception:
+        trace_path = None
 
     manifest = {
         "baseline_affinity": baseline_affinity,
@@ -323,11 +474,16 @@ def run_optimization(
         "baseline_smiles": baseline_smiles,
         "ligand_indices": ligand_indices.astype(int).tolist(),
         "target_counts": ligand_summary.sort_values("feature_index")["new_value"].astype(int).tolist(),
+        "ligand_adjustments": ligand_adjustments,
+        "manifold_weight": manifold_weight,
     }
     (step_dir / "target_manifest.json").write_text(json.dumps(manifest, indent=2))
 
     details = manifest | {"protein_indices": protein_indices.astype(int).tolist()}
-    return {"summary": summary_path, "manifest": step_dir / "target_manifest.json"}, details
+    outputs = {"summary": summary_path, "manifest": step_dir / "target_manifest.json"}
+    if trace_path:
+        outputs["trace"] = trace_path
+    return outputs, details
 
 
 # ------------------------------ retrieval ------------------------------ #
@@ -343,6 +499,18 @@ def _compute_mol_weight(smiles: str) -> Optional[float]:
     return float(Descriptors.MolWt(mol))
 
 
+def _canonical_smiles(smiles: str) -> str:
+    """Return canonical SMILES if RDKit is available, else the original string."""
+    try:
+        from rdkit import Chem
+    except ImportError:
+        return smiles
+    m = Chem.MolFromSmiles(smiles)
+    if m is None:
+        return smiles
+    return Chem.MolToSmiles(m, canonical=True)
+
+
 def retrieve_candidates(
     cfg: RetrievalConfig,
     step_dir: Path,
@@ -353,6 +521,7 @@ def retrieve_candidates(
     step_dir.mkdir(parents=True, exist_ok=True)
     ligand_indices = optimization_details.get("ligand_indices", [])
     target_counts = optimization_details.get("target_counts", [])
+    ligand_adjustments = optimization_details.get("ligand_adjustments", [])
     if len(ligand_indices) == 0 or len(target_counts) == 0:
         return {}, {"skipped": True, "reason": "No ligand feature adjustments to anchor retrieval."}
 
@@ -363,7 +532,15 @@ def retrieve_candidates(
 
     fingerprint_subset = ligand_mat[:, bucket_array].astype(np.float32, copy=False)
     diff_matrix = np.abs(fingerprint_subset - target_counts_arr)
-    l1_distance = diff_matrix.sum(axis=1)
+    # Heavily weight edited buckets; lightly weight unchanged ones.
+    weights = np.ones_like(target_counts_arr) * 0.2
+    if len(ligand_adjustments) == len(target_counts_arr):
+        adj = np.asarray(ligand_adjustments, dtype=np.float32)
+        weights = np.where(np.abs(adj) > 0, 5.0 * (1.0 + np.abs(adj)), 0.2)
+    else:
+        weights = np.ones_like(target_counts_arr)
+    weighted_diff = diff_matrix * weights
+    l1_distance = weighted_diff.sum(axis=1)
     max_bucket_diff = diff_matrix.max(axis=1)
 
     baseline_index = int(optimization_details.get("sample_index", 0))
@@ -373,11 +550,15 @@ def retrieve_candidates(
 
     candidate_records = []
     seen_smiles = set()
+    seen_canonical = set()
     for idx, (distance, row) in enumerate(zip(l1_distance, processed.itertuples(index=False))):
         if idx == baseline_index:
             continue
         smi = getattr(row, "smiles", getattr(row, "Drug", None))
         if not smi or smi in seen_smiles:
+            continue
+        can_smi = _canonical_smiles(smi)
+        if can_smi in seen_canonical:
             continue
         smiles_len = len(smi)
         if baseline_smiles_len > 0:
@@ -409,6 +590,7 @@ def retrieve_candidates(
             }
         )
         seen_smiles.add(smi)
+        seen_canonical.add(can_smi)
         if cfg.top_candidates and len(candidate_records) >= cfg.top_candidates:
             break
 
@@ -548,13 +730,30 @@ def _parse_vina_score(stdout_text: str, log_path: Path) -> Optional[float]:
     return None
 
 
-def dock_candidates(cfg: DockingConfig, step_dir: Path, candidates_csv: Path) -> StepOutputs:
+def dock_candidates(
+    cfg: DockingConfig,
+    step_dir: Path,
+    candidates_csv: Path,
+    baseline_smiles: Optional[str] = None,
+    baseline_index: Optional[int] = None,
+) -> StepOutputs:
     step_dir.mkdir(parents=True, exist_ok=True)
     if not cfg.enabled:
         return {}, {"skipped": True, "reason": "Docking disabled"}
     df = pd.read_csv(candidates_csv)
     if df.empty:
         return {}, {"skipped": True, "reason": "No candidates to dock"}
+
+    if baseline_smiles:
+        already_has_baseline = False
+        if "smiles" in df.columns:
+            already_has_baseline = df["smiles"].astype(str).eq(str(baseline_smiles)).any()
+        if not already_has_baseline:
+            extra = {
+                "dataset_index": int(baseline_index) if baseline_index is not None else -1,
+                "smiles": baseline_smiles,
+            }
+            df = pd.concat([pd.DataFrame([extra]), df], ignore_index=True)
 
     center = cfg.center
     size = cfg.size
@@ -573,7 +772,12 @@ def dock_candidates(cfg: DockingConfig, step_dir: Path, candidates_csv: Path) ->
 
     results = []
     limit = cfg.limit or len(df)
-    for idx, row in enumerate(df.itertuples(index=False)):
+    iterator = enumerate(df.itertuples(index=False))
+    try:
+        iterator = tqdm(iterator, total=len(df), desc="[docking] vina")  # type: ignore[arg-type]
+    except Exception:
+        pass
+    for idx, row in iterator:
         cand_id = getattr(row, "dataset_index", None) or getattr(row, "candidate_id", None) or idx
         smi = getattr(row, "smiles")
         cand_dir = out_root / f"cand_{cand_id}"
@@ -677,13 +881,71 @@ def build_report(
     candidates_csv: Path,
     docking_csv: Optional[Path],
     admet_csv: Optional[Path],
+    baseline_index: Optional[int] = None,
+    baseline_smiles: Optional[str] = None,
+    processed_csv: Optional[Path] = None,
+    protein_path: Optional[Path] = None,
+    ligand_path: Optional[Path] = None,
+    feat_cfg: Optional[FeatureConfig] = None,
 ) -> StepOutputs:
     step_dir.mkdir(parents=True, exist_ok=True)
     base_df = pd.read_csv(candidates_csv) if candidates_csv and Path(candidates_csv).exists() else pd.DataFrame()
     if base_df.empty:
         return {}, {"skipped": True, "reason": "No candidates available for report"}
 
+    def _attach_affinity(df: pd.DataFrame) -> pd.DataFrame:
+        if processed_csv is None or protein_path is None or ligand_path is None or feat_cfg is None:
+            return df
+        if not (Path(processed_csv).exists() and Path(protein_path).exists() and Path(ligand_path).exists()):
+            return df
+        try:
+            protein_mat = np.load(protein_path)
+            ligand_mat = np.load(ligand_path)
+            device = torch.device(feat_cfg.device) if feat_cfg.device else torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+            model = _load_model(feat_cfg.checkpoint, protein_mat.shape[1], ligand_mat.shape[1], device, feat_cfg)
+            use_esm = feat_cfg.protein_encoder.lower() == "esm"
+            use_amp = device.type == "cuda" and not use_esm
+            affinities: List[float] = []
+            with torch.no_grad():
+                for idx in df["dataset_index"].astype(int):
+                    if idx < 0 or idx >= len(ligand_mat):
+                        affinities.append(np.nan)
+                        continue
+                    ligand_vec = ligand_mat[idx]
+                    protein_vec = protein_mat[idx]
+                    ligand_tensor = torch.tensor(ligand_vec, dtype=torch.float32, device=device)
+                    if use_esm:
+                        protein_tensor = torch.tensor(protein_vec, dtype=torch.long, device=device)
+                        if protein_tensor.dim() == 1:
+                            protein_tensor = protein_tensor.unsqueeze(0)
+                        if ligand_tensor.dim() == 1:
+                            ligand_tensor = ligand_tensor.unsqueeze(0)
+                        _, _, pred = model.inference(ligand_tensor, protein_tensor)
+                    else:
+                        protein_tensor = torch.tensor(protein_vec, dtype=torch.float32, device=device)
+                        with autocast(enabled=use_amp):
+                            _, _, pred = model.inference(ligand_tensor.unsqueeze(0), protein_tensor.unsqueeze(0))
+                    affinities.append(float(pred.item()))
+            df = df.copy()
+            df["predicted_affinity"] = affinities
+            return df
+        except Exception:
+            return df
+
     merged = base_df.copy()
+
+    # Prepend the baseline molecule for easy reference.
+    if baseline_smiles is not None or baseline_index is not None:
+        baseline_row = {
+            "dataset_index": int(baseline_index) if baseline_index is not None else -1,
+            "smiles": baseline_smiles,
+        }
+        merged = pd.concat([pd.DataFrame([baseline_row]), merged], ignore_index=True)
+
+    merged.insert(0, "start_mol", np.arange(len(merged), dtype=int))
+    merged = _attach_affinity(merged)
     if docking_csv and Path(docking_csv).exists():
         dock_df = pd.read_csv(docking_csv)
         merged = merged.merge(dock_df[["candidate_id", "vina_score"]], left_on="dataset_index", right_on="candidate_id", how="left")
@@ -691,6 +953,39 @@ def build_report(
     if admet_csv and Path(admet_csv).exists():
         admet_df = pd.read_csv(admet_csv)
         merged = merged.merge(admet_df.drop(columns=["distance_L1", "max_bucket_difference"], errors="ignore"), on="smiles", how="left")
+
+    def _attach_baseline_admet(df: pd.DataFrame) -> pd.DataFrame:
+        if baseline_smiles is None:
+            return df
+        baseline_mask = df["smiles"].astype(str) == str(baseline_smiles)
+        if not baseline_mask.any():
+            return df
+        # If we already have ADMET values for baseline, keep them.
+        admet_cols = list(getattr(feat_cfg, "admet_keys", []) or [])
+        if admet_cols and df.loc[baseline_mask, admet_cols].notna().any(axis=None):
+            return df
+        try:
+            from admet_ai import ADMETModel
+        except Exception:
+            return df
+        model = _silent_run(ADMETModel)
+        preds = _silent_run(model.predict, [baseline_smiles])
+        if isinstance(preds, pd.DataFrame):
+            pred_row = preds.iloc[0].to_dict()
+        elif isinstance(preds, (list, tuple)) and preds:
+            pred_row = dict(preds[0])
+        elif isinstance(preds, dict):
+            pred_row = preds
+        else:
+            return df
+        if not admet_cols:
+            admet_cols = list(pred_row.keys())
+        df = df.copy()
+        for col in admet_cols:
+            df.loc[baseline_mask, col] = pred_row.get(col)
+        return df
+
+    merged = _attach_baseline_admet(merged)
 
     report_path = step_dir / "nevermore_report.csv"
     merged.to_csv(report_path, index=False)

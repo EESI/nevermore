@@ -16,7 +16,6 @@ STAGE_ORDER = [
     "retrieval",
     "visualization",
     "docking",
-    "admet",
     "report",
 ]
 
@@ -70,6 +69,8 @@ class NevermorePipeline:
             "max_token_length": cfg.max_token_length,
             "morgan_bits": cfg.morgan_bits,
             "morgan_radius": cfg.morgan_radius,
+            "admet_in_features": getattr(cfg, "admet_in_features", False),
+            "admet_keys": getattr(cfg, "admet_keys", []),
         }
         files = {"raw_combined": ingest_res.outputs["raw_combined"]}
         return self.cache.run_step(
@@ -96,8 +97,10 @@ class NevermorePipeline:
             "frozen_ligand_features": opt_cfg.frozen_ligand_features,
             "budget": opt_cfg.budget,
             "regularization": opt_cfg.regularization,
+            "manifold_weight": opt_cfg.manifold_weight,
             "target_sequence": opt_cfg.target_sequence,
             "baseline_smiles": opt_cfg.baseline_smiles,
+            "admet_constraints": opt_cfg.admet_constraints,
         }
         files = {
             "processed": feat_res.outputs["processed"],
@@ -105,6 +108,8 @@ class NevermorePipeline:
             "ligand": feat_res.outputs["ligand"],
             "checkpoint": feat_cfg.checkpoint,
         }
+        if "admet" in feat_res.outputs:
+            files["admet"] = feat_res.outputs["admet"]
         return self.cache.run_step(
             "optimization",
             payload,
@@ -116,6 +121,7 @@ class NevermorePipeline:
                 feat_res.outputs["processed"],
                 feat_res.outputs["protein"],
                 feat_res.outputs["ligand"],
+                feat_res.outputs.get("admet"),
             ),
         )
 
@@ -173,13 +179,23 @@ class NevermorePipeline:
             "center": cfg.center,
             "size": cfg.size,
             "limit": cfg.limit,
+            "baseline_index": retrieval_res.details.get("baseline_index") if retrieval_res else None,
+            "baseline_smiles": retrieval_res.details.get("baseline_smiles") if retrieval_res else None,
         }
         files = {"candidates": candidates} if candidates else {}
         return self.cache.run_step(
             "docking",
             payload,
             files,
-            lambda step_dir: steps.dock_candidates(cfg, step_dir, candidates) if candidates else ({}, {}),
+            lambda step_dir: steps.dock_candidates(
+                cfg,
+                step_dir,
+                candidates,
+                retrieval_res.details.get("baseline_smiles") if retrieval_res else None,
+                retrieval_res.details.get("baseline_index") if retrieval_res else None,
+            )
+            if candidates
+            else ({}, {}),
         )
 
     def _run_admet(self) -> StepResult:
@@ -202,17 +218,44 @@ class NevermorePipeline:
         if retrieval_res is None:
             raise RuntimeError("Run retrieval before report")
         candidates = retrieval_res.outputs.get("candidates")
+        feat_res = self.results.get("features")
+        admet_csv = feat_res.outputs.get("admet") if feat_res else None
         docking_res = self.results.get("docking")
-        admet_res = self.results.get("admet")
         docking_csv = docking_res.outputs.get("docking") if docking_res else None
-        admet_csv = admet_res.outputs.get("admet") if admet_res else None
-        payload = {"enabled": self.config.report.enabled}
-        files = {k: v for k, v in {"candidates": candidates, "docking": docking_csv, "admet": admet_csv}.items() if v}
+        payload = {
+            "enabled": self.config.report.enabled,
+            "baseline_index": retrieval_res.details.get("baseline_index") if retrieval_res else None,
+            "baseline_smiles": retrieval_res.details.get("baseline_smiles") if retrieval_res else None,
+        }
+        files = {
+            k: v
+            for k, v in {
+                "candidates": candidates,
+                "docking": docking_csv,
+                "admet": admet_csv,
+                "processed": feat_res.outputs.get("processed") if feat_res else None,
+                "protein": feat_res.outputs.get("protein") if feat_res else None,
+                "ligand": feat_res.outputs.get("ligand") if feat_res else None,
+                "checkpoint": self.config.features.checkpoint,
+            }.items()
+            if v
+        }
         return self.cache.run_step(
             "report",
             payload,
             files,
-            lambda step_dir: steps.build_report(step_dir, candidates, docking_csv, admet_csv)
+            lambda step_dir: steps.build_report(
+                step_dir,
+                candidates,
+                docking_csv,
+                admet_csv,
+                retrieval_res.details.get("baseline_index") if retrieval_res else None,
+                retrieval_res.details.get("baseline_smiles") if retrieval_res else None,
+                feat_res.outputs.get("processed") if feat_res else None,
+                feat_res.outputs.get("protein") if feat_res else None,
+                feat_res.outputs.get("ligand") if feat_res else None,
+                self.config.features,
+            )
             if candidates
             else ({}, {}),
         )

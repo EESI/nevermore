@@ -17,26 +17,36 @@ features:
   checkpoint: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/output/esm_morgan_trainer/esm_morgan_run_morgan_more/checkpoint.pt
   batch_size: 64
   device: null              # "cuda" | "cpu" | null (auto)
+  admet_in_features: true   # compute ADMET during feature build (requires admet-ai)
+  admet_keys: [molecular_weight, logP, HIA_Hou, hERG, QED, Lipinski]
 
 optimization:
   target_affinity: 12.0
   sample_index: 10
   protein_features: 0
-  ligand_features: 15
+  ligand_features: 50
   allow_protein_adjustments: false
   allow_ligand_adjustments: true
   frozen_protein_features: []
   frozen_ligand_features: []
-  budget: 300
-  regularization: 0.001
+  budget: 400
+  manifold_weight: 0.1
   target_sequence: null     # optional override instead of dataset index
   baseline_smiles: null     # optional override instead of dataset index
+  admet_constraints:
+      - {key: hERG, max: 0.2, weight: 2.0}            # ADMET-AI: predicted probability of hERG blockade (cardiotoxicity liability). Lower is safer; keep ≤0.2.
+      - {key: logP, min: 0.5, max: 3.5, weight: 2.0}  # ADMET-AI logP (lipophilicity). 0.5–3.5 balances permeability vs solubility/clearance; too high increases ADME/tox risks.
+      # - {key: molecular_weight, max: 500, weight: 0.5} # ADMET-AI MW in Da. ≤500 supports oral exposure and reduces permeability/solubility penalties; >500 often harder ADME.
+      - {key: QED, min: 0.5, weight: 2.0}             # ADMET-AI QED (0–1 drug-likeness). ≥0.6 pushes toward well-balanced “drug-like” structures.
+      # - {key: HIA_Hou, min: 0.7, weight: 1.0}         # ADMET-AI HIA (Hou) predicted probability of good human intestinal absorption. ≥0.7 favors oral absorption.
+      - {key: Lipinski, min: 3, weight: 0.5}          # ADMET-AI Lipinski count (0–4 rules satisfied). ≥3 is a solid filter; 4 is ideal if you can enforce it.
+
 
 retrieval:
-  max_rel_smiles_len_diff: 0.30
-  max_rel_mw_diff: 0.30
+  max_rel_smiles_len_diff: 1
+  max_rel_mw_diff: 1
   max_l1_distance: null
-  top_candidates: 20
+  top_candidates: 10
 
 visualization:
   enabled: true
@@ -48,7 +58,7 @@ visualization:
   out_png: candidate_ligands_grid.png
 
 docking:
-  enabled: True
+  enabled: False
   target_key: 3U84
   receptor_pdbqt: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/3U84.pdbqt
   out_root: null            # defaults to nevermore/outputs/docking/<signature>
@@ -56,12 +66,9 @@ docking:
   num_modes: 20
   seed: 42
   limit: null               # set int to cap ligands
-  center: [15, -63, 1]              # supply [x, y, z] to override TDC metadata
+  center: [15, -64, 1]              # supply [x, y, z] to override TDC metadata
   size: [30.0, 30.0, 30.0]
 
-admet:
-  enabled: True
-  keys: [molecular_weight, logP, HIA_Hou, hERG, QED, Lipinski]
 
 report:
   enabled: true
