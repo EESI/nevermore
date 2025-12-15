@@ -218,6 +218,7 @@ class NevermorePipeline:
         if retrieval_res is None:
             raise RuntimeError("Run retrieval before report")
         candidates = retrieval_res.outputs.get("candidates")
+        opt_res = self.results.get("optimization")
         feat_res = self.results.get("features")
         admet_csv = feat_res.outputs.get("admet") if feat_res else None
         docking_res = self.results.get("docking")
@@ -226,6 +227,7 @@ class NevermorePipeline:
             "enabled": self.config.report.enabled,
             "baseline_index": retrieval_res.details.get("baseline_index") if retrieval_res else None,
             "baseline_smiles": retrieval_res.details.get("baseline_smiles") if retrieval_res else None,
+            "optimization_signature": opt_res.signature if opt_res else None,
         }
         files = {
             k: v
@@ -255,6 +257,7 @@ class NevermorePipeline:
                 feat_res.outputs.get("protein") if feat_res else None,
                 feat_res.outputs.get("ligand") if feat_res else None,
                 self.config.features,
+                opt_res.details if opt_res else None,
             )
             if candidates
             else ({}, {}),

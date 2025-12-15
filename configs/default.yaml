@@ -1,7 +1,7 @@
 run_name: nevermore-demo2
 paths:
   repo_root: null           # auto-detected; leave null unless running elsewhere
-  output_root: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/outputs    # writes to <repo>/outputs
+  output_root: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/outputs2    # writes to <repo>/outputs
 
 data:
   data_dir: data
@@ -12,41 +12,41 @@ features:
   protein_encoder: esm       # "esm" to use ESM tokens, "handcrafted" for unigram/bigram counts
   esm_model: facebook/esm2_t12_35M_UR50D
   max_token_length: 1500
-  morgan_bits: 4048
-  morgan_radius: 2
-  checkpoint: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/output/esm_morgan_trainer/esm_morgan_run_morgan_more/checkpoint.pt
+  morgan_bits: 4096
+  morgan_radius: 3
+  checkpoint: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/output/esm_morgan_trainer/esm_morgan_run/checkpoint_21.pt
   batch_size: 64
-  device: null              # "cuda" | "cpu" | null (auto)
+  device: "cuda"              # "cuda" | "cpu" | null (auto)
   admet_in_features: true   # compute ADMET during feature build (requires admet-ai)
   admet_keys: [molecular_weight, logP, HIA_Hou, hERG, QED, Lipinski]
 
 optimization:
-  target_affinity: 12.0
-  sample_index: 10
+  target_affinity: 14.0
+  sample_index: 0
   protein_features: 0
-  ligand_features: 50
+  ligand_features: 6
   allow_protein_adjustments: false
   allow_ligand_adjustments: true
   frozen_protein_features: []
   frozen_ligand_features: []
-  budget: 245
+  budget: 200
   manifold_weight: 0
   target_sequence: null     # optional override instead of dataset index
   baseline_smiles: null     # optional override instead of dataset index
-  admet_constraints:
-      - {key: hERG, max: 0.1, weight: 3.0}            # ADMET-AI: predicted probability of hERG blockade (cardiotoxicity liability). Lower is safer; keep ≤0.2.
+  admet_constraints: []
+      # - {key: hERG, max: 0.1, weight: 3.0}            # ADMET-AI: predicted probability of hERG blockade (cardiotoxicity liability). Lower is safer; keep ≤0.2.
       # - {key: logP, min: 0.5, max: 3.5, weight: 2.0}  # ADMET-AI logP (lipophilicity). 0.5–3.5 balances permeability vs solubility/clearance; too high increases ADME/tox risks.
       # - {key: molecular_weight, max: 500, weight: 0.5} # ADMET-AI MW in Da. ≤500 supports oral exposure and reduces permeability/solubility penalties; >500 often harder ADME.
-      - {key: QED, min: 0.5, weight: 2.0}             # ADMET-AI QED (0–1 drug-likeness). ≥0.6 pushes toward well-balanced “drug-like” structures.
+      # - {key: QED, min: 0.5, weight: 2.0}             # ADMET-AI QED (0–1 drug-likeness). ≥0.6 pushes toward well-balanced “drug-like” structures.
       # - {key: HIA_Hou, min: 0.7, weight: 1.0}         # ADMET-AI HIA (Hou) predicted probability of good human intestinal absorption. ≥0.7 favors oral absorption.
       # - {key: Lipinski, min: 3, weight: 0.5}          # ADMET-AI Lipinski count (0–4 rules satisfied). ≥3 is a solid filter; 4 is ideal if you can enforce it.
 
 
 retrieval:
-  max_rel_smiles_len_diff: 1
-  max_rel_mw_diff: 1
+  max_rel_smiles_len_diff: 0.3
+  max_rel_mw_diff: 0.3
   max_l1_distance: null
-  top_candidates: 10
+  top_candidates: 30
 
 visualization:
   enabled: true
