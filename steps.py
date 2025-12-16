@@ -294,8 +294,8 @@ def run_optimization(
 
     ligand_weights = np.ones(ligand_mat.shape[1], dtype=np.float32)
     if ligand_count > 0:
-        ligand_weights.fill(1)               # downweight untouched buckets
-        ligand_weights[ligand_indices] = 1.0   # emphasize editable buckets
+        ligand_weights.fill(1)               #  or downweight untouched buckets
+        ligand_weights[ligand_indices] = 2.0   # emphasize editable buckets
 
     # ---------------- ADMET constraints ----------------
     admet_array = None
@@ -377,7 +377,7 @@ def run_optimization(
 
     # ---- knobs to reduce "stuck constant" behavior ----
     use_rounding = bool(getattr(opt_cfg, "use_rounding", True))
-    soft_T = float(getattr(opt_cfg, "softmin_T", 0.75) or 0.75)          # smaller -> closer to min, larger -> closer to mean
+    soft_T = float(getattr(opt_cfg, "softmin_T", 0.5) or 0.5)          # smaller -> closer to min, larger -> closer to mean
     novelty_weight = float(getattr(opt_cfg, "novelty_weight", 0) or 0)  # >0 penalizes repeated projected_idx_best
 
     def discretize_ligand(vec: np.ndarray) -> np.ndarray:
@@ -395,7 +395,7 @@ def run_optimization(
 
     # --------------- Projection-in-loop: fast NN on edited indices ---------------
     S = ligand_indices.astype(int)
-    nn_k = int(getattr(opt_cfg, "nn_k", 30) or 30)  # top-K projection size
+    nn_k = int(getattr(opt_cfg, "nn_k", 10) or 10)  # top-K projection size
 
     lig_mat_S = ligand_mat[:, S].astype(np.float32, copy=False) if len(S) else None
     wS = ligand_weights[S].astype(np.float32, copy=False) if len(S) else None
@@ -412,7 +412,21 @@ def run_optimization(
             return np.array([idx], dtype=int), dist
 
         # distance only on editable dims (fast)
-        var = np.sum(np.abs(lig_mat_S - lig_bucket[S][None, :]) * wS[None, :], axis=1).astype(np.float32)
+        
+        # var = np.sum(np.abs(lig_mat_S - lig_bucket[S][None, :]) * wS[None, :], axis=1).astype(np.float32)
+
+        t = lig_bucket[S].astype(np.float32, copy=False)
+        t = np.clip(t, 0.0, None)  # counts should be non-negative
+
+        X = lig_mat_S  # (N, |S|) float32
+        W = wS         # (|S|,) float32, non-negative
+
+        overlap = np.minimum(X, t[None, :]) * W[None, :]
+        union   = np.maximum(X, t[None, :]) * W[None, :]
+
+        jaccard = overlap.sum(axis=1) / (union.sum(axis=1) + 1e-9)
+        var = (1.0 - jaccard).astype(np.float32)  # smaller = closer
+
         dist = var
 
         K = max(1, min(nn_k, dist.shape[0]))
@@ -521,18 +535,22 @@ def run_optimization(
         # avg-of-K
         loss_avg = float(np.mean(losses_np))
 
-        # softmin-of-K: w_i ∝ exp(-loss_i / T)
-        if len(losses_np) > 1:
-            T = max(soft_T, 1e-8)
-            x = -losses_np / T
-            x = x - np.max(x)  # stabilize
-            w = np.exp(x)
-            w = w / (np.sum(w) + 1e-12)
-            loss_soft = float(np.sum(w * losses_np))
-            pred_avg = float(np.mean(np.asarray(preds, dtype=np.float32)))
-        else:
-            loss_soft = float(losses_np[0])
-            pred_avg = float(preds[0])
+        loss_soft = loss_avg
+        
+        pred_avg = float(np.mean(np.asarray(preds, dtype=np.float32)))
+
+        # # softmin-of-K: w_i ∝ exp(-loss_i / T)
+        # if len(losses_np) > 1:
+        #     T = max(soft_T, 1e-8)
+        #     x = -losses_np / T
+        #     x = x - np.max(x)  # stabilize
+        #     w = np.exp(x)
+        #     w = w / (np.sum(w) + 1e-12)
+        #     loss_soft = float(np.sum(w * losses_np))
+        #     pred_avg = float(np.mean(np.asarray(preds, dtype=np.float32)))
+        # else:
+        #     loss_soft = float(losses_np[0])
+        #     pred_avg = float(preds[0])
 
         # novelty/repeat penalty (optional)
         rep_penalty = 0.0
@@ -758,16 +776,30 @@ def retrieve_candidates(
     target_counts_arr = np.array(target_counts, dtype=np.float32)
 
     fingerprint_subset = ligand_mat[:, bucket_array].astype(np.float32, copy=False)
-    diff_matrix = np.abs(fingerprint_subset - target_counts_arr)
     # Heavily weight edited buckets; lightly weight unchanged ones.
     weights = np.ones_like(target_counts_arr) #* 0.2
-    # if len(ligand_adjustments) == len(target_counts_arr):
-    #     adj = np.asarray(ligand_adjustments, dtype=np.float32)
-    #     weights = np.where(np.abs(adj) > 0, 5.0 * (1.0 + np.abs(adj)), 0.2)
-    # else:
-    #     weights = np.ones_like(target_counts_arr)
-    weighted_diff = diff_matrix * weights
-    l1_distance = weighted_diff.sum(axis=1)
+    if len(ligand_adjustments) == len(target_counts_arr):
+        adj = np.asarray(ligand_adjustments, dtype=np.float32)
+        weights = np.where(np.abs(adj) > 0, 2.0 * (1.0 + np.abs(adj)),1)
+    else:
+        weights = np.ones_like(target_counts_arr)
+
+    diff_matrix = np.abs(fingerprint_subset - target_counts_arr)
+    # weighted_diff = diff_matrix * weights
+    # l1_distance = weighted_diff.sum(axis=1)
+
+    # i jsut added jaccard to test
+    X = fingerprint_subset.astype(np.float32)
+    t = target_counts_arr.astype(np.float32)          # ensure shape (D,) or (1,D)
+    w = weights.astype(np.float32)
+
+    overlap = np.minimum(X, t) * w
+    union   = np.maximum(X, t) * w
+
+    jaccard = overlap.sum(axis=1) / (union.sum(axis=1) + 1e-9)
+    l1_distance = 1.0 - jaccard   # smaller is closer
+
+
     max_bucket_diff = diff_matrix.max(axis=1)
 
     baseline_smiles = optimization_details.get("baseline_smiles")
@@ -780,46 +812,67 @@ def retrieve_candidates(
     candidate_records = []
     seen_smiles = set()
     seen_canonical = set()
-    for idx, (distance, row) in enumerate(zip(l1_distance, processed.itertuples(index=False))):
-        smi = getattr(row, "smiles", getattr(row, "Drug", None))
+    # sort candidates by distance (closest first)
+    order = np.argsort(l1_distance)  # ascending
+
+    for idx in order:
+        distance = float(l1_distance[idx])
+        row = processed.iloc[idx]
+
+        # get smiles
+        smi = row["smiles"] if "smiles" in processed.columns else row.get("Drug", None)
         if not smi or smi in seen_smiles:
             continue
+
         can_smi = _canonical_smiles(smi)
         if can_smi in seen_canonical:
             continue
+
+        # length filter
         smiles_len = len(smi)
         if baseline_smiles_len > 0:
             rel_len_diff = abs(smiles_len - baseline_smiles_len) / baseline_smiles_len
             if rel_len_diff > cfg.max_rel_smiles_len_diff:
                 continue
-        cand_mw = getattr(row, "MolWt", None)
-        if pd.notna(cand_mw):
+
+        # MW filter
+        cand_mw = row["MolWt"] if "MolWt" in processed.columns else None
+        if cand_mw is not None and pd.notna(cand_mw):
             cand_mw = float(cand_mw)
         else:
             cand_mw = _compute_mol_weight(smi)
+
         if baseline_mw and cand_mw:
             rel_mw_diff = abs(cand_mw - baseline_mw) / baseline_mw
             if rel_mw_diff > cfg.max_rel_mw_diff:
                 continue
+
+        # distance threshold
         if cfg.max_l1_distance is not None and distance > cfg.max_l1_distance:
             continue
 
+        # record
         counts = fingerprint_subset[idx].astype(int).tolist()
+        dataset_index = row["dataset_index"] if "dataset_index" in processed.columns else idx
+
         candidate_records.append(
             {
-                "dataset_index": int(getattr(row, "dataset_index", idx)),
+                "dataset_index": int(dataset_index),
                 "smiles": smi,
-                "smiles_length": smiles_len,
-                "mol_weight": cand_mw,
-                "distance_L1": float(distance),
+                "smiles_length": int(smiles_len),
+                "mol_weight": float(cand_mw) if cand_mw is not None else np.nan,
+                "distance_L1": float(distance),  # NOTE: this is now (1 - jaccard) if you used jaccard
                 "max_bucket_difference": float(max_bucket_diff[idx]),
                 "bucket_counts": json.dumps(counts),
             }
         )
+
         seen_smiles.add(smi)
         seen_canonical.add(can_smi)
+
         if cfg.top_candidates and len(candidate_records) >= cfg.top_candidates:
             break
+
 
     if not candidate_records:
         return {}, {"skipped": True, "reason": "No candidates matched retrieval thresholds."}
@@ -1119,6 +1172,8 @@ def build_report(
     base_df = pd.read_csv(candidates_csv) if candidates_csv and Path(candidates_csv).exists() else pd.DataFrame()
     if base_df.empty:
         return {}, {"skipped": True, "reason": "No candidates available for report"}
+    if "smiles" in base_df.columns:
+        base_df = base_df.drop_duplicates(subset=["smiles"], keep="first")
 
     def _build_override_protein() -> Optional[np.ndarray]:
         if optimization_details is None or feat_cfg is None:
@@ -1204,16 +1259,31 @@ def build_report(
             "smiles": baseline_smiles,
         }
         merged = pd.concat([pd.DataFrame([baseline_row]), merged], ignore_index=True)
+    if "smiles" in merged.columns:
+        merged = merged.drop_duplicates(subset=["smiles"], keep="first")
 
     merged.insert(0, "start_mol", np.arange(len(merged), dtype=int))
     merged = _attach_affinity(merged)
     if docking_csv and Path(docking_csv).exists():
         dock_df = pd.read_csv(docking_csv)
-        merged = merged.merge(dock_df[["candidate_id", "vina_score"]], left_on="dataset_index", right_on="candidate_id", how="left")
-        merged = merged.drop(columns=["candidate_id"])
+        dock_df = dock_df.drop(columns=["candidate_id", "dataset_index"], errors="ignore")
+        if "smiles" in dock_df.columns:
+            merged = merged.merge(dock_df, on="smiles", how="left")
+
+        else:
+            merged = merged.merge(dock_df, left_on="dataset_index", right_on="candidate_id", how="left")
+            merged = merged.drop(columns=["candidate_id"], errors="ignore")
+
     if admet_csv and Path(admet_csv).exists():
         admet_df = pd.read_csv(admet_csv)
-        merged = merged.merge(admet_df.drop(columns=["distance_L1", "max_bucket_difference"], errors="ignore"), on="smiles", how="left")
+        admet_df = admet_df.drop(columns=["distance_L1", "max_bucket_difference", "dataset_index"], errors="ignore")
+        if "smiles" in admet_df.columns:
+            admet_df = admet_df.drop_duplicates(subset=["smiles"], keep="first")
+            merged = merged.merge(admet_df, on="smiles", how="left")
+        else:
+            merged = merged.merge(admet_df, how="left")
+
+
 
     def _attach_baseline_admet(df: pd.DataFrame) -> pd.DataFrame:
         if baseline_smiles is None:
