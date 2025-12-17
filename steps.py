@@ -229,8 +229,6 @@ def run_optimization(
 
     This version:
       - evaluates ALL top-K neighbors each step
-      - logs best/avg/softmin over top-K to a separate CSV
-      - optimizes a smoother objective (softmin over top-K) to avoid "constant/stuck" behavior
       - optional novelty penalty to avoid repeating the same projected_idx forever
       - optional disable rounding during optimization (round only at the end)
 
@@ -377,7 +375,6 @@ def run_optimization(
 
     # ---- knobs to reduce "stuck constant" behavior ----
     use_rounding = bool(getattr(opt_cfg, "use_rounding", True))
-    soft_T = float(getattr(opt_cfg, "softmin_T", 0.5) or 0.5)          # smaller -> closer to min, larger -> closer to mean
     novelty_weight = float(getattr(opt_cfg, "novelty_weight", 0) or 0)  # >0 penalizes repeated projected_idx_best
 
     def discretize_ligand(vec: np.ndarray) -> np.ndarray:
@@ -412,7 +409,6 @@ def run_optimization(
             return np.array([idx], dtype=int), dist
 
         # distance only on editable dims (fast)
-        
         # var = np.sum(np.abs(lig_mat_S - lig_bucket[S][None, :]) * wS[None, :], axis=1).astype(np.float32)
 
         t = lig_bucket[S].astype(np.float32, copy=False)
@@ -426,7 +422,6 @@ def run_optimization(
 
         jaccard = overlap.sum(axis=1) / (union.sum(axis=1) + 1e-9)
         var = (1.0 - jaccard).astype(np.float32)  # smaller = closer
-
         dist = var
 
         K = max(1, min(nn_k, dist.shape[0]))
@@ -451,7 +446,6 @@ def run_optimization(
         Computes:
           - best-of-K neighbor (for reporting + manifest)
           - avg-of-K loss (for analysis)
-          - softmin-of-K loss (for smoother optimization)
         """
         delta = np.asarray(delta, dtype=np.float32)
 
@@ -510,8 +504,9 @@ def run_optimization(
 
             manifold_distance = float(dist[idx])
             manifold_penalty = manifold_weight * manifold_distance if manifold_weight > 0.0 else 0.0
-
-            loss = float(deviation**2 + admet_penalty + manifold_penalty)
+            # + manifold_penalty
+            
+            loss = float(deviation**2 + admet_penalty)
 
             losses.append(loss)
             preds.append(float(pred))
@@ -535,22 +530,10 @@ def run_optimization(
         # avg-of-K
         loss_avg = float(np.mean(losses_np))
 
-        loss_soft = loss_avg
         
         pred_avg = float(np.mean(np.asarray(preds, dtype=np.float32)))
 
-        # # softmin-of-K: w_i ∝ exp(-loss_i / T)
-        # if len(losses_np) > 1:
-        #     T = max(soft_T, 1e-8)
-        #     x = -losses_np / T
-        #     x = x - np.max(x)  # stabilize
-        #     w = np.exp(x)
-        #     w = w / (np.sum(w) + 1e-12)
-        #     loss_soft = float(np.sum(w * losses_np))
-        #     pred_avg = float(np.mean(np.asarray(preds, dtype=np.float32)))
-        # else:
-        #     loss_soft = float(losses_np[0])
-        #     pred_avg = float(preds[0])
+
 
         # novelty/repeat penalty (optional)
         rep_penalty = 0.0
@@ -558,7 +541,7 @@ def run_optimization(
             c = seen_counts.get(best["projected_idx"], 0)
             rep_penalty = novelty_weight * float(c)
 
-        ng_objective = float(loss_soft + rep_penalty)
+        ng_objective = float(loss_avg + rep_penalty)
 
         return {
             # best-of-K (use this for final selection/manifest)
@@ -568,7 +551,6 @@ def run_optimization(
             "loss_best": float(best["loss"]),
             "pred_best": float(best["pred"]) if best["pred"] is not None else np.nan,
             "loss_avg_topk": loss_avg,
-            "loss_soft_topk": loss_soft,
             "pred_avg_topk": pred_avg,
             "rep_penalty": float(rep_penalty),
             "ng_objective": ng_objective,
@@ -629,7 +611,6 @@ def run_optimization(
                 "nn_k": int(nn_k),
                 "loss_best": float(out["loss_best"]),
                 "loss_avg_topk": float(out["loss_avg_topk"]),
-                "loss_soft_topk": float(out["loss_soft_topk"]),
                 "pred_best": float(out["pred_best"]),
                 "pred_avg_topk": float(out["pred_avg_topk"]),
                 "rep_penalty": float(out["rep_penalty"]),
@@ -712,7 +693,6 @@ def run_optimization(
         "ligand_adjustments": ligand_adjustments,
         "manifold_weight": float(manifold_weight),
         "nn_k": int(nn_k),
-        "softmin_T": float(soft_T),
         "use_rounding": bool(use_rounding),
         "novelty_weight": float(novelty_weight),
         "projected_neighbor_index": int(projected_idx) if projected_idx is not None else None,
@@ -786,7 +766,7 @@ def retrieve_candidates(
 
     diff_matrix = np.abs(fingerprint_subset - target_counts_arr)
     # weighted_diff = diff_matrix * weights
-    # l1_distance = weighted_diff.sum(axis=1)
+    # distance = weighted_diff.sum(axis=1)
 
     # i jsut added jaccard to test
     X = fingerprint_subset.astype(np.float32)
@@ -797,7 +777,7 @@ def retrieve_candidates(
     union   = np.maximum(X, t) * w
 
     jaccard = overlap.sum(axis=1) / (union.sum(axis=1) + 1e-9)
-    l1_distance = 1.0 - jaccard   # smaller is closer
+    distance = 1.0 - jaccard   # smaller is closer
 
 
     max_bucket_diff = diff_matrix.max(axis=1)
@@ -813,10 +793,10 @@ def retrieve_candidates(
     seen_smiles = set()
     seen_canonical = set()
     # sort candidates by distance (closest first)
-    order = np.argsort(l1_distance)  # ascending
+    order = np.argsort(distance)  # ascending
 
     for idx in order:
-        distance = float(l1_distance[idx])
+        distance = float(distance[idx])
         row = processed.iloc[idx]
 
         # get smiles
@@ -847,9 +827,6 @@ def retrieve_candidates(
             if rel_mw_diff > cfg.max_rel_mw_diff:
                 continue
 
-        # distance threshold
-        if cfg.max_l1_distance is not None and distance > cfg.max_l1_distance:
-            continue
 
         # record
         counts = fingerprint_subset[idx].astype(int).tolist()
@@ -861,7 +838,7 @@ def retrieve_candidates(
                 "smiles": smi,
                 "smiles_length": int(smiles_len),
                 "mol_weight": float(cand_mw) if cand_mw is not None else np.nan,
-                "distance_L1": float(distance),  # NOTE: this is now (1 - jaccard) if you used jaccard
+                "distance": float(distance),  
                 "max_bucket_difference": float(max_bucket_diff[idx]),
                 "bucket_counts": json.dumps(counts),
             }

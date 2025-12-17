@@ -4,4 +4,3 @@ __pycache__/
 
 # Ignore notebooks within this package
 *.ipynb
-notebooks/
