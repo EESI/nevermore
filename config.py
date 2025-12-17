@@ -25,20 +25,20 @@ class PathsConfig:
 @dataclass
 class DataConfig:
     data_dir: Path = Path("data")
-    train_file: str = "train.csv"
-    test_file: str = "test.csv"
+    optimization_db: str = "optimization.csv"
+    retrieval_db: str = "retrieval.csv"
 
-    def train_path(self, repo_root: Path) -> Path:
+    def optimization_path(self, repo_root: Path) -> Path:
         base = Path(self.data_dir)
         if not base.is_absolute():
             base = Path(repo_root) / base
-        return base / self.train_file
+        return base / self.optimization_db
 
-    def test_path(self, repo_root: Path) -> Path:
+    def retrieval_path(self, repo_root: Path) -> Path:
         base = Path(self.data_dir)
         if not base.is_absolute():
             base = Path(repo_root) / base
-        return base / self.test_file
+        return base / self.retrieval_db
 
 
 @dataclass

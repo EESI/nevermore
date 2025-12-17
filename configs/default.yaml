@@ -5,8 +5,8 @@ paths:
 
 data:
   data_dir: data
-  train_file: train.csv
-  test_file: test.csv
+  optimization_db: train.csv # test
+  retrieval_db: test.csv # # test
 
 features:
   protein_encoder: esm       # "esm" to use ESM tokens, "handcrafted" for unigram/bigram counts
@@ -29,7 +29,7 @@ optimization:
   allow_ligand_adjustments: true
   frozen_protein_features: []
   frozen_ligand_features: []
-  budget: 265
+  budget: 300
   manifold_weight: 0
   target_sequence: null     # optional override instead of dataset index
   baseline_smiles: null     # optional override instead of dataset index

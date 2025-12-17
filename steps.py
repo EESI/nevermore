@@ -56,25 +56,28 @@ def _alias_firm_dti_modules() -> None:
 # ------------------------------ ingest ------------------------------ #
 def ingest_data(cfg: DataConfig, repo_root: Path, step_dir: Path, verbose: bool = False) -> StepOutputs:
     step_dir.mkdir(parents=True, exist_ok=True)
-    train_path = cfg.train_path(repo_root)
-    test_path = cfg.test_path(repo_root)
-    train_df = pd.read_csv(train_path)
-    test_df = pd.read_csv(test_path)
-    train_df = train_df.copy()
-    test_df = test_df.copy()
-    train_df["split"] = "train"
-    test_df["split"] = "test"
-    combined = pd.concat([train_df, test_df], ignore_index=True)
-    combined_path = step_dir / "raw_combined.csv"
-    combined.to_csv(combined_path, index=False)
+    opt_path = cfg.optimization_path(repo_root)
+    ret_path = cfg.retrieval_path(repo_root)
+    opt_df = pd.read_csv(opt_path)
+    ret_df = pd.read_csv(ret_path)
+    opt_df = opt_df.copy()
+    ret_df = ret_df.copy()
+    opt_df["split"] = "optimization"
+    ret_df["split"] = "retrieval"
+    opt_out = step_dir / "raw_optimization.csv"
+    ret_out = step_dir / "raw_retrieval.csv"
+    opt_df.to_csv(opt_out, index=False)
+    ret_df.to_csv(ret_out, index=False)
     details = {
-        "rows": len(combined),
-        "columns": combined.columns.tolist(),
-        "split_counts": {"train": len(train_df), "test": len(test_df)},
+        "optimization_rows": len(opt_df),
+        "retrieval_rows": len(ret_df),
+        "columns_opt": opt_df.columns.tolist(),
+        "columns_ret": ret_df.columns.tolist(),
     }
     if verbose:
-        print(f"[ingest] combined {len(combined)} rows (train={len(train_df)}, test={len(test_df)}) -> {combined_path}")
-    return {"raw_combined": combined_path}, details
+        print(f"[ingest] loaded optimization={len(opt_df)} rows -> {opt_out}")
+        print(f"[ingest] loaded retrieval={len(ret_df)} rows -> {ret_out}")
+    return {"raw_optimization": opt_out, "raw_retrieval": ret_out}, details
 
 
 # ------------------------------ features ------------------------------ #
@@ -796,7 +799,7 @@ def retrieve_candidates(
     order = np.argsort(distance)  # ascending
 
     for idx in order:
-        distance = float(distance[idx])
+        dist_i = float(distance[idx])
         row = processed.iloc[idx]
 
         # get smiles
@@ -838,7 +841,7 @@ def retrieve_candidates(
                 "smiles": smi,
                 "smiles_length": int(smiles_len),
                 "mol_weight": float(cand_mw) if cand_mw is not None else np.nan,
-                "distance": float(distance),  
+                "distance": float(dist_i),  
                 "max_bucket_difference": float(max_bucket_diff[idx]),
                 "bucket_counts": json.dumps(counts),
             }
@@ -1110,7 +1113,7 @@ def admet_predictions(cfg: AdmetConfig, step_dir: Path, candidates_csv: Path) ->
         raise RuntimeError("admet-ai is required for ADMET predictions") from e
 
     model = _silent_run(ADMETModel)
-    preds = _silent_run(model.predict, df["smiles"].astype(str).tolist())
+    preds = model.predict, df["smiles"].astype(str).tolist()
     if isinstance(preds, pd.DataFrame):
         pred_rows = preds.to_dict(orient="records")
     elif isinstance(preds, (list, tuple)):

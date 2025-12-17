@@ -49,8 +49,12 @@ class NevermorePipeline:
     def _run_ingest(self) -> StepResult:
         cfg = self.config.data
         repo_root = self.config.paths.repo_root
-        payload = {"data_dir": str(cfg.data_dir), "train_file": cfg.train_file, "test_file": cfg.test_file}
-        files = {"train": cfg.train_path(repo_root), "test": cfg.test_path(repo_root)}
+        payload = {
+            "data_dir": str(cfg.data_dir),
+            "optimization_db": cfg.optimization_db,
+            "retrieval_db": cfg.retrieval_db,
+        }
+        files = {"optimization": cfg.optimization_path(repo_root), "retrieval": cfg.retrieval_path(repo_root)}
         return self.cache.run_step(
             "ingest",
             payload,
@@ -72,13 +76,29 @@ class NevermorePipeline:
             "admet_in_features": getattr(cfg, "admet_in_features", False),
             "admet_keys": getattr(cfg, "admet_keys", []),
         }
-        files = {"raw_combined": ingest_res.outputs["raw_combined"]}
-        return self.cache.run_step(
-            "features",
-            payload,
-            files,
-            lambda step_dir: steps.build_features(cfg, step_dir, ingest_res.outputs["raw_combined"], verbose=self._verbose),
-        )
+        files = {
+            "raw_optimization": ingest_res.outputs["raw_optimization"],
+            "raw_retrieval": ingest_res.outputs["raw_retrieval"],
+        }
+
+        def _run_features_dual(step_dir: Path):
+            # Optimization features (with optional ADMET)
+            opt_dir = step_dir / "optimization"
+            opt_outputs, opt_details = steps.build_features(
+                cfg, opt_dir, ingest_res.outputs["raw_optimization"], verbose=self._verbose
+            )
+            # Retrieval features (no ADMET to avoid extra work unless enabled)
+            ret_cfg = cfg
+            ret_dir = step_dir / "retrieval"
+            ret_outputs, ret_details = steps.build_features(
+                ret_cfg, ret_dir, ingest_res.outputs["raw_retrieval"], verbose=self._verbose
+            )
+            # Prefix keys
+            outputs = {f"opt_{k}": v for k, v in opt_outputs.items()} | {f"ret_{k}": v for k, v in ret_outputs.items()}
+            details = {"optimization": opt_details, "retrieval": ret_details}
+            return outputs, details
+
+        return self.cache.run_step("features", payload, files, _run_features_dual)
 
     def _run_optimization(self) -> StepResult:
         feat_res = self.results.get("features")
@@ -103,13 +123,13 @@ class NevermorePipeline:
             "admet_constraints": opt_cfg.admet_constraints,
         }
         files = {
-            "processed": feat_res.outputs["processed"],
-            "protein": feat_res.outputs["protein"],
-            "ligand": feat_res.outputs["ligand"],
+            "processed": feat_res.outputs["opt_processed"],
+            "protein": feat_res.outputs["opt_protein"],
+            "ligand": feat_res.outputs["opt_ligand"],
             "checkpoint": feat_cfg.checkpoint,
         }
-        if "admet" in feat_res.outputs:
-            files["admet"] = feat_res.outputs["admet"]
+        if "opt_admet" in feat_res.outputs:
+            files["admet"] = feat_res.outputs["opt_admet"]
         return self.cache.run_step(
             "optimization",
             payload,
@@ -118,10 +138,10 @@ class NevermorePipeline:
                 opt_cfg,
                 feat_cfg,
                 step_dir,
-                feat_res.outputs["processed"],
-                feat_res.outputs["protein"],
-                feat_res.outputs["ligand"],
-                feat_res.outputs.get("admet"),
+                feat_res.outputs["opt_processed"],
+                feat_res.outputs["opt_protein"],
+                feat_res.outputs["opt_ligand"],
+                feat_res.outputs.get("opt_admet"),
             ),
         )
 
@@ -141,13 +161,13 @@ class NevermorePipeline:
             "target_counts": opt_res.details.get("target_counts"),
             "baseline_smiles": opt_res.details.get("baseline_smiles"),
         }
-        files = {"processed": feat_res.outputs["processed"], "ligand": feat_res.outputs["ligand"]}
+        files = {"processed": feat_res.outputs["ret_processed"], "ligand": feat_res.outputs["ret_ligand"]}
         return self.cache.run_step(
             "retrieval",
             payload,
             files,
             lambda step_dir: steps.retrieve_candidates(
-                cfg, step_dir, feat_res.outputs["processed"], feat_res.outputs["ligand"], opt_res.details
+                cfg, step_dir, feat_res.outputs["ret_processed"], feat_res.outputs["ret_ligand"], opt_res.details
             ),
         )
 
@@ -220,7 +240,7 @@ class NevermorePipeline:
         candidates = retrieval_res.outputs.get("candidates")
         opt_res = self.results.get("optimization")
         feat_res = self.results.get("features")
-        admet_csv = feat_res.outputs.get("admet") if feat_res else None
+        admet_csv = feat_res.outputs.get("ret_admet") if feat_res else None
         docking_res = self.results.get("docking")
         docking_csv = docking_res.outputs.get("docking") if docking_res else None
         payload = {
@@ -235,9 +255,9 @@ class NevermorePipeline:
                 "candidates": candidates,
                 "docking": docking_csv,
                 "admet": admet_csv,
-                "processed": feat_res.outputs.get("processed") if feat_res else None,
-                "protein": feat_res.outputs.get("protein") if feat_res else None,
-                "ligand": feat_res.outputs.get("ligand") if feat_res else None,
+                "processed": feat_res.outputs.get("ret_processed") if feat_res else None,
+                "protein": feat_res.outputs.get("ret_protein") if feat_res else None,
+                "ligand": feat_res.outputs.get("ret_ligand") if feat_res else None,
                 "checkpoint": self.config.features.checkpoint,
             }.items()
             if v
@@ -253,9 +273,9 @@ class NevermorePipeline:
                 admet_csv,
                 retrieval_res.details.get("baseline_index") if retrieval_res else None,
                 retrieval_res.details.get("baseline_smiles") if retrieval_res else None,
-                feat_res.outputs.get("processed") if feat_res else None,
-                feat_res.outputs.get("protein") if feat_res else None,
-                feat_res.outputs.get("ligand") if feat_res else None,
+                feat_res.outputs.get("ret_processed") if feat_res else None,
+                feat_res.outputs.get("ret_protein") if feat_res else None,
+                feat_res.outputs.get("ret_ligand") if feat_res else None,
                 self.config.features,
                 opt_res.details if opt_res else None,
             )
