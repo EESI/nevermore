@@ -69,6 +69,7 @@ class OptimizationConfig:
     frozen_ligand_features: List[int] = field(default_factory=list)
     budget: int = 300
     regularization: float = 0.001
+    beta: float = 0.0  # optional extra weight (e.g., ADMET penalty)
     manifold_weight: float = 0.0  # weight for dataset-manifold proximity penalty
     target_sequence: Optional[str] = None
     baseline_smiles: Optional[str] = None

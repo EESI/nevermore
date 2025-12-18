@@ -117,6 +117,7 @@ class NevermorePipeline:
             "frozen_ligand_features": opt_cfg.frozen_ligand_features,
             "budget": opt_cfg.budget,
             "regularization": opt_cfg.regularization,
+            "beta": getattr(opt_cfg, "beta", 0.0),
             "manifold_weight": opt_cfg.manifold_weight,
             "target_sequence": opt_cfg.target_sequence,
             "baseline_smiles": opt_cfg.baseline_smiles,

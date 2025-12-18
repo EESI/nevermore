@@ -391,7 +391,7 @@ def run_optimization(
 
     baseline_affinity = score_pair(base_protein, base_ligand)
 
-    manifold_weight = float(getattr(opt_cfg, "manifold_weight", 0.0) or 0.0)
+    beta = float(getattr(opt_cfg, "beta", 0.0) or 0.0)
 
     # --------------- Projection-in-loop: fast NN on edited indices ---------------
     S = ligand_indices.astype(int)
@@ -411,20 +411,22 @@ def run_optimization(
             idx = int(np.argmin(dist))
             return np.array([idx], dtype=int), dist
 
-        # distance only on editable dims (fast)
-        # var = np.sum(np.abs(lig_mat_S - lig_bucket[S][None, :]) * wS[None, :], axis=1).astype(np.float32)
+        # distance only on editable dims (fast) L1-dist
+        var = np.sum(np.abs(lig_mat_S - lig_bucket[S][None, :]) * wS[None, :], axis=1).astype(np.float32)
 
-        t = lig_bucket[S].astype(np.float32, copy=False)
-        t = np.clip(t, 0.0, None)  # counts should be non-negative
+        # Jaccard
+        # t = lig_bucket[S].astype(np.float32, copy=False)
+        # t = np.clip(t, 0.0, None)  # counts should be non-negative
 
-        X = lig_mat_S  # (N, |S|) float32
-        W = wS         # (|S|,) float32, non-negative
+        # X = lig_mat_S  # (N, |S|) float32
+        # W = wS         # (|S|,) float32, non-negative
 
-        overlap = np.minimum(X, t[None, :]) * W[None, :]
-        union   = np.maximum(X, t[None, :]) * W[None, :]
+        # overlap = np.minimum(X, t[None, :]) * W[None, :]
+        # union   = np.maximum(X, t[None, :]) * W[None, :]
 
-        jaccard = overlap.sum(axis=1) / (union.sum(axis=1) + 1e-9)
-        var = (1.0 - jaccard).astype(np.float32)  # smaller = closer
+        # jaccard = overlap.sum(axis=1) / (union.sum(axis=1) + 1e-9)
+        # var = (1.0 - jaccard).astype(np.float32)  # smaller = closer
+
         dist = var
 
         K = max(1, min(nn_k, dist.shape[0]))
@@ -506,10 +508,9 @@ def run_optimization(
                         admet_penalty += pen["weight"] * (val - pen["max"]) ** 2
 
             manifold_distance = float(dist[idx])
-            manifold_penalty = manifold_weight * manifold_distance if manifold_weight > 0.0 else 0.0
             # + manifold_penalty
-            
-            loss = float(deviation**2 + admet_penalty)
+            #####dddd
+            loss = float(deviation**2 + beta*admet_penalty)
 
             losses.append(loss)
             preds.append(float(pred))
@@ -522,7 +523,6 @@ def run_optimization(
                         "loss": float(loss),
                         "pred": float(pred),
                         "admet_penalty": float(admet_penalty),
-                        "manifold_distance": manifold_distance if manifold_weight > 0.0 else None,
                         "projected_idx": int(idx),
                         "admet_vals": admet_vals,
                     }
@@ -694,7 +694,6 @@ def run_optimization(
         "ligand_indices": ligand_indices.astype(int).tolist(),
         "target_counts": ligand_summary.sort_values("feature_index")["new_value"].tolist(),
         "ligand_adjustments": ligand_adjustments,
-        "manifold_weight": float(manifold_weight),
         "nn_k": int(nn_k),
         "use_rounding": bool(use_rounding),
         "novelty_weight": float(novelty_weight),
@@ -768,19 +767,19 @@ def retrieve_candidates(
         weights = np.ones_like(target_counts_arr)
 
     diff_matrix = np.abs(fingerprint_subset - target_counts_arr)
-    # weighted_diff = diff_matrix * weights
-    # distance = weighted_diff.sum(axis=1)
+    weighted_diff = diff_matrix * weights
+    distance = weighted_diff.sum(axis=1)
 
-    # i jsut added jaccard to test
-    X = fingerprint_subset.astype(np.float32)
-    t = target_counts_arr.astype(np.float32)          # ensure shape (D,) or (1,D)
-    w = weights.astype(np.float32)
+    # # i jsut added jaccard to test
+    # X = fingerprint_subset.astype(np.float32)
+    # t = target_counts_arr.astype(np.float32)          # ensure shape (D,) or (1,D)
+    # w = weights.astype(np.float32)
 
-    overlap = np.minimum(X, t) * w
-    union   = np.maximum(X, t) * w
+    # overlap = np.minimum(X, t) * w
+    # union   = np.maximum(X, t) * w
 
-    jaccard = overlap.sum(axis=1) / (union.sum(axis=1) + 1e-9)
-    distance = 1.0 - jaccard   # smaller is closer
+    # jaccard = overlap.sum(axis=1) / (union.sum(axis=1) + 1e-9)
+    # distance = 1.0 - jaccard   # smaller is closer
 
 
     max_bucket_diff = diff_matrix.max(axis=1)
