@@ -53,13 +53,21 @@ def _alias_firm_dti_modules() -> None:
         pass
 
 
+# Pick delimiter based on file extension so CSV/TSV inputs both work.
+def _read_table(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix in {".tsv", ".txt"}:
+        return pd.read_csv(path, sep="\t")
+    return pd.read_csv(path)
+
+
 # ------------------------------ ingest ------------------------------ #
 def ingest_data(cfg: DataConfig, repo_root: Path, step_dir: Path, verbose: bool = False) -> StepOutputs:
     step_dir.mkdir(parents=True, exist_ok=True)
     opt_path = cfg.optimization_path(repo_root)
     ret_path = cfg.retrieval_path(repo_root)
-    opt_df = pd.read_csv(opt_path)
-    ret_df = pd.read_csv(ret_path)
+    opt_df = _read_table(opt_path)
+    ret_df = _read_table(ret_path)
     opt_df = opt_df.copy()
     ret_df = ret_df.copy()
     opt_df["split"] = "optimization"
@@ -94,6 +102,7 @@ def build_features(cfg: FeatureConfig, step_dir: Path, raw_csv: Path, verbose: b
     filtered["dataset_index"] = np.arange(len(filtered))
     filtered["smiles"] = filtered["Drug"]
 
+    skip_protein = bool(getattr(cfg, "skip_protein_features", False))
     protein_feat_list = []
     ligand_feat_list = []
     iterable = filtered.itertuples(index=False)
@@ -103,7 +112,7 @@ def build_features(cfg: FeatureConfig, step_dir: Path, raw_csv: Path, verbose: b
     use_esm = cfg.protein_encoder.lower() == "esm"
     tokenizer = None
     max_len = None
-    if use_esm:
+    if use_esm and not skip_protein:
         try:
             from transformers import AutoTokenizer
         except ImportError as e:
@@ -112,20 +121,24 @@ def build_features(cfg: FeatureConfig, step_dir: Path, raw_csv: Path, verbose: b
         max_len = min(cfg.max_token_length, tokenizer.model_max_length)
 
     for row in iterable:
-        if use_esm:
-            tokens = tokenizer(
-                row.Target,
-                return_tensors="pt",
-                truncation=True,
-                padding="max_length",
-                max_length=max_len,
-            )["input_ids"].squeeze(0).numpy()
-            protein_feat_list.append(tokens.astype(np.int64, copy=False))
-        else:
-            protein_feat_list.append(protein_feature_vector(row.Target))
+        if not skip_protein:
+            if use_esm:
+                tokens = tokenizer(
+                    row.Target,
+                    return_tensors="pt",
+                    truncation=True,
+                    padding="max_length",
+                    max_length=max_len,
+                )["input_ids"].squeeze(0).numpy()
+                protein_feat_list.append(tokens.astype(np.int64, copy=False))
+            else:
+                protein_feat_list.append(protein_feature_vector(row.Target))
         ligand_feat_list.append(ligand_feature_vector(row.Drug, cfg.morgan_bits, cfg.morgan_radius))
 
-    protein_mat = np.stack(protein_feat_list)
+    if skip_protein:
+        protein_mat = np.zeros((len(filtered), 0), dtype=np.float32)
+    else:
+        protein_mat = np.stack(protein_feat_list)
     ligand_mat = np.stack(ligand_feat_list)
 
     admet_path: Optional[Path] = None
@@ -170,6 +183,8 @@ def build_features(cfg: FeatureConfig, step_dir: Path, raw_csv: Path, verbose: b
         "ligand_dim": int(ligand_mat.shape[1]),
         "protein_encoder": cfg.protein_encoder,
     }
+    if skip_protein:
+        details["protein_features_skipped"] = True
     if admet_path:
         details["admet_rows"] = admet_rows
         details["admet_keys"] = admet_cols
@@ -244,7 +259,12 @@ def run_optimization(
     step_dir.mkdir(parents=True, exist_ok=True)
 
     processed = pd.read_csv(processed_csv)
-    protein_mat = np.load(protein_path)
+    skip_protein = bool(getattr(feat_cfg, "skip_protein_features", False))
+    protein_mat = (
+        np.zeros((len(processed), 0), dtype=np.float32)
+        if skip_protein
+        else np.load(protein_path)
+    )
     ligand_mat = np.load(ligand_path)
 
     # if opt_cfg.sample_index >= len(processed):
@@ -281,10 +301,11 @@ def run_optimization(
         if feat_cfg.device
         else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     )
-    model = _load_model(feat_cfg.checkpoint, protein_mat.shape[1], ligand_mat.shape[1], device, feat_cfg)
+    protein_dim = int(base_protein.shape[-1])
+    model = _load_model(feat_cfg.checkpoint, protein_dim, ligand_mat.shape[1], device, feat_cfg)
     use_amp = device.type == "cuda" and not use_esm
 
-    protein_count = 0 if use_esm else (opt_cfg.protein_features if opt_cfg.allow_protein_adjustments else 0)
+    protein_count = 0 if (use_esm or skip_protein) else (opt_cfg.protein_features if opt_cfg.allow_protein_adjustments else 0)
     ligand_count = opt_cfg.ligand_features if opt_cfg.allow_ligand_adjustments else 0
 
     protein_std = protein_mat.std(axis=0) if protein_count > 0 else np.zeros(0, dtype=np.float32)
@@ -1180,6 +1201,8 @@ def build_report(
         if processed_csv is None or protein_path is None or ligand_path is None or feat_cfg is None:
             return df
         if not (Path(processed_csv).exists() and Path(protein_path).exists() and Path(ligand_path).exists()):
+            return df
+        if getattr(feat_cfg, "skip_protein_features", False):
             return df
         try:
             protein_mat = np.load(protein_path)

@@ -71,6 +71,7 @@ class NevermorePipeline:
             "protein_encoder": cfg.protein_encoder,
             "esm_model": cfg.esm_model,
             "max_token_length": cfg.max_token_length,
+            "skip_protein_features": getattr(cfg, "skip_protein_features", False),
             "morgan_bits": cfg.morgan_bits,
             "morgan_radius": cfg.morgan_radius,
             "admet_in_features": getattr(cfg, "admet_in_features", False),
@@ -122,6 +123,7 @@ class NevermorePipeline:
             "target_sequence": opt_cfg.target_sequence,
             "baseline_smiles": opt_cfg.baseline_smiles,
             "admet_constraints": opt_cfg.admet_constraints,
+            "skip_protein_features": getattr(feat_cfg, "skip_protein_features", False),
         }
         files = {
             "processed": feat_res.outputs["opt_processed"],

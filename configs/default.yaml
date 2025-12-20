@@ -1,20 +1,22 @@
 run_name: nevermore-demo2
 paths:
   repo_root: null           # auto-detected; leave null unless running elsewhere
-  output_root: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/outputs2    # writes to <repo>/outputs
+  output_root: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/pipeline_output    # writes to <repo>/outputs
 
 data:
   data_dir: data
-  optimization_db: train.csv # test
-  retrieval_db: test.csv # # test
+  optimization_db: train.csv 
+  retrieval_db: chembl36_id_smiles.tsv 
+
 
 features:
   protein_encoder: esm       # "esm" to use ESM tokens, "handcrafted" for unigram/bigram counts
   esm_model: facebook/esm2_t12_35M_UR50D
   max_token_length: 1500
-  morgan_bits: 4096
+  skip_protein_features: true   # skip protein featurization to speed up ingestion/feature build
+  morgan_bits: 1024
   morgan_radius: 3
-  checkpoint: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/output/esm_morgan_trainer/esm_morgan_run/checkpoint_21.pt
+  checkpoint: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/output/esm_morgan_trainer/final/checkpoint.pt
   batch_size: 64
   device: "cuda"              # "cuda" | "cpu" | null (auto)
   admet_in_features: true   # compute ADMET during feature build (requires admet-ai)
@@ -24,12 +26,12 @@ optimization:
   target_affinity: 12.0
   sample_index: 0
   protein_features: 0
-  ligand_features: 100
+  ligand_features: 50
   allow_protein_adjustments: false
   allow_ligand_adjustments: true
   frozen_protein_features: []
   frozen_ligand_features: []
-  budget: 200
+  budget: 100
   beta: 0.01             # weight for ADMET penalty term
   manifold_weight: 0
   target_sequence: null     # optional override instead of dataset index

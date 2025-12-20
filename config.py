@@ -48,6 +48,7 @@ class FeatureConfig:
     max_token_length: int = 1500
     morgan_bits: int = 1024
     morgan_radius: int = 2
+    skip_protein_features: bool = False
     checkpoint: Path = Path("./output/model_2/trainer2/Firm-D4-prj2/checkpoint.pt")
     batch_size: int = 64
     device: Optional[str] = None  # "cuda", "cpu", or None for auto
