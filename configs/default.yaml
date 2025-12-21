@@ -18,7 +18,7 @@ features:
   morgan_radius: 3
   checkpoint: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/output/esm_morgan_trainer/final/checkpoint.pt
   batch_size: 64
-  device: "cuda"              # "cuda" | "cpu" | null (auto)
+  device: "cuda:7"              # "cuda" | "cpu" | null (auto)
   admet_in_features: true   # compute ADMET during feature build (requires admet-ai)
   admet_keys: [molecular_weight, logP, HIA_Hou, hERG, QED, Lipinski]
 
@@ -26,13 +26,13 @@ optimization:
   target_affinity: 12.0
   sample_index: 0
   protein_features: 0
-  ligand_features: 50
+  ligand_features: 70
   allow_protein_adjustments: false
   allow_ligand_adjustments: true
   frozen_protein_features: []
   frozen_ligand_features: []
-  budget: 100
-  beta: 0.01             # weight for ADMET penalty term
+  budget: 150
+  beta: 0.1             # weight for ADMET penalty term
   manifold_weight: 0
   target_sequence: null     # optional override instead of dataset index
   baseline_smiles: null     # optional override instead of dataset index
@@ -49,10 +49,10 @@ retrieval:
   max_rel_smiles_len_diff: 0.3
   max_rel_mw_diff: 0.3
   max_l1_distance: null
-  top_candidates: 31
+  top_candidates: 100
 
 visualization:
-  enabled: true
+  enabled: False
   max_mols: 40
   mols_per_row: 6
   panel_size: [300, 240]

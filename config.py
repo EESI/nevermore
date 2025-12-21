@@ -117,6 +117,7 @@ class AdmetConfig:
     keys: List[str] = field(
         default_factory=lambda: ["molecular_weight", "logP", "HIA_Hou", "hERG", "QED", "Lipinski"]
     )
+    batch_size: int = 256
 
 
 @dataclass

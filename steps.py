@@ -149,9 +149,9 @@ def build_features(cfg: FeatureConfig, step_dir: Path, raw_csv: Path, verbose: b
         except ImportError as e:
             raise RuntimeError("admet-ai is required for ADMET feature computation") from e
 
-        model = _silent_run(ADMETModel)
+        model = _silent_run(ADMETModel, num_workers=8)
         smiles_list = filtered["smiles"].astype(str).tolist()
-        preds = _silent_run(model.predict, smiles_list)
+        preds = model.predict(smiles_list)
         if isinstance(preds, pd.DataFrame):
             pred_df = preds.reset_index(drop=True)
         elif isinstance(preds, (list, tuple)):
@@ -1024,15 +1024,11 @@ def dock_candidates(
         return {}, {"skipped": True, "reason": "No candidates to dock"}
 
     if baseline_smiles:
-        already_has_baseline = False
-        if "smiles" in df.columns:
-            already_has_baseline = df["smiles"].astype(str).eq(str(baseline_smiles)).any()
-        if not already_has_baseline:
-            extra = {
-                "dataset_index": -1,
-                "smiles": baseline_smiles,
-            }
-            df = pd.concat([pd.DataFrame([extra]), df], ignore_index=True)
+        extra = {
+            "dataset_index": -1,
+            "smiles": baseline_smiles,
+        }
+        df = pd.concat([pd.DataFrame([extra]), df], ignore_index=True)
 
     center = cfg.center
     size = cfg.size
@@ -1201,8 +1197,6 @@ def build_report(
         if processed_csv is None or protein_path is None or ligand_path is None or feat_cfg is None:
             return df
         if not (Path(processed_csv).exists() and Path(protein_path).exists() and Path(ligand_path).exists()):
-            return df
-        if getattr(feat_cfg, "skip_protein_features", False):
             return df
         try:
             protein_mat = np.load(protein_path)

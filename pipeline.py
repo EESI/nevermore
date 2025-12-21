@@ -227,7 +227,7 @@ class NevermorePipeline:
             raise RuntimeError("Run retrieval before admet")
         cfg = self.config.admet
         candidates = retrieval_res.outputs.get("candidates")
-        payload = {"enabled": cfg.enabled, "keys": cfg.keys}
+        payload = {"enabled": cfg.enabled, "keys": cfg.keys, "batch_size": getattr(cfg, "batch_size", 256)}
         files = {"candidates": candidates} if candidates else {}
         return self.cache.run_step(
             "admet",
