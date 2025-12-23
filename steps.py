@@ -9,6 +9,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import re
 
 import numpy as np
 import pandas as pd
@@ -314,10 +315,6 @@ def run_optimization(
     protein_indices = _select_indices(protein_std, protein_count)
     ligand_indices = _select_indices(ligand_std, ligand_count)
 
-    ligand_weights = np.ones(ligand_mat.shape[1], dtype=np.float32)
-    if ligand_count > 0:
-        ligand_weights.fill(1)               #  or downweight untouched buckets
-        ligand_weights[ligand_indices] = 2.0   # emphasize editable buckets
 
     # ---------------- ADMET constraints ----------------
     admet_array = None
@@ -419,21 +416,27 @@ def run_optimization(
     nn_k = int(getattr(opt_cfg, "nn_k", 10) or 10)  # top-K projection size
 
     lig_mat_S = ligand_mat[:, S].astype(np.float32, copy=False) if len(S) else None
-    wS = ligand_weights[S].astype(np.float32, copy=False) if len(S) else None
 
-    def project_neighbors(lig_bucket: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def project_neighbors(lig_bucket: np.ndarray, ligand_delta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Returns:
           idxs: (K,) indices of nearest real ligands
           dist: (N,) weighted L1 distances used (for manifold penalty/logging)
         """
-        if ligand_count == 0:
-            dist = np.sum(np.abs(ligand_mat - lig_bucket[None, :]) * ligand_weights[None, :], axis=1).astype(np.float32)
-            idx = int(np.argmin(dist))
-            return np.array([idx], dtype=int), dist
 
-        # distance only on editable dims (fast) L1-dist
-        var = np.sum(np.abs(lig_mat_S - lig_bucket[S][None, :]) * wS[None, :], axis=1).astype(np.float32)
+        # Turn on weight if either the baseline bucket and the delta is non-zero
+        delta  = np.abs(ligand_delta)
+        # bucket = np.abs(lig_bucket[S])
+
+        weights = np.ones_like(delta, dtype=np.float32)
+        # weights[bucket > 0] = 1.0
+        weights[delta  > 0] = (1.0 + 2.0 * delta[delta > 0]).astype(np.float32)
+
+        dist = np.sum(
+            np.abs(lig_mat_S - lig_bucket[S][None, :]) * weights[None, :],
+            axis=1,
+        ).astype(np.float32)
+
 
         # Jaccard
         # t = lig_bucket[S].astype(np.float32, copy=False)
@@ -446,9 +449,8 @@ def run_optimization(
         # union   = np.maximum(X, t[None, :]) * W[None, :]
 
         # jaccard = overlap.sum(axis=1) / (union.sum(axis=1) + 1e-9)
-        # var = (1.0 - jaccard).astype(np.float32)  # smaller = closer
+        # dist = (1.0 - jaccard).astype(np.float32)  # smaller = closer
 
-        dist = var
 
         K = max(1, min(nn_k, dist.shape[0]))
         if K == 1:
@@ -488,7 +490,7 @@ def run_optimization(
             ligand_bucket[ligand_indices] += ligand_delta
             ligand_bucket = discretize_ligand(ligand_bucket)
 
-        idxs, dist = project_neighbors(ligand_bucket)
+        idxs, dist = project_neighbors(ligand_bucket,ligand_delta)
 
         # evaluate ALL K neighbors
         losses: List[float] = []
@@ -559,13 +561,13 @@ def run_optimization(
 
 
 
-        # novelty/repeat penalty (optional)
-        rep_penalty = 0.0
-        if include_rep_penalty and novelty_weight > 0.0 and best["projected_idx"] is not None:
-            c = seen_counts.get(best["projected_idx"], 0)
-            rep_penalty = novelty_weight * float(c)
+        # # novelty/repeat penalty (optional)
+        # rep_penalty = 0.0
+        # if include_rep_penalty and novelty_weight > 0.0 and best["projected_idx"] is not None:
+        #     c = seen_counts.get(best["projected_idx"], 0)
+        #     rep_penalty = novelty_weight * float(c)
 
-        ng_objective = float(loss_avg + rep_penalty)
+        ng_objective = float(loss_avg)
 
         return {
             # best-of-K (use this for final selection/manifest)
@@ -576,7 +578,6 @@ def run_optimization(
             "pred_best": float(best["pred"]) if best["pred"] is not None else np.nan,
             "loss_avg_topk": loss_avg,
             "pred_avg_topk": pred_avg,
-            "rep_penalty": float(rep_penalty),
             "ng_objective": ng_objective,
 
             # raw top-K lists (JSON-logged)
@@ -584,7 +585,6 @@ def run_optimization(
             "topk_preds": [float(p) for p in preds],
             "topk_losses": [float(l) for l in losses],
             "topk_admet_penalties": [float(a) for a in admet_penalties_k],
-            "topk_manifold_distances": [float(m) for m in manifold_distances_k],
 
             # payload
             "protein_adjusted": protein_adjusted,
@@ -600,7 +600,22 @@ def run_optimization(
     trace_topk: List[Dict[str, Any]] = []
 
     def logging_objective(delta):
-        out = evaluate(delta, include_rep_penalty=True)
+        def _safe_float(val: Any) -> float:
+            try:
+                f = float(val)
+            except Exception:
+                return np.nan
+            return np.nan if math.isnan(f) else f
+
+        out = evaluate(delta, include_rep_penalty=False)
+        admet_vals = out.get("admet_vals") or {}
+        clean_admet_vals = {k: _safe_float(v) for k, v in admet_vals.items()}
+        admet_cols = {f"admet_{k}": clean_admet_vals.get(k, np.nan) for k in admet_keys} if admet_keys else {}
+        admet_json = (
+            json.dumps({k: v for k, v in clean_admet_vals.items() if not math.isnan(v)})
+            if clean_admet_vals
+            else None
+        )
 
         # update repeat counts AFTER evaluation
         if out["projected_idx"] is not None:
@@ -624,6 +639,8 @@ def run_optimization(
                 "ligand_counts": json.dumps(out["ligand_bucket"][ligand_indices].astype(int).tolist())
                 if ligand_count > 0 and use_rounding
                 else None,
+                **admet_cols,
+                "admet_values_best": admet_json,
             }
         )
 
@@ -637,14 +654,13 @@ def run_optimization(
                 "loss_avg_topk": float(out["loss_avg_topk"]),
                 "pred_best": float(out["pred_best"]),
                 "pred_avg_topk": float(out["pred_avg_topk"]),
-                "rep_penalty": float(out["rep_penalty"]),
                 "ng_objective": float(out["ng_objective"]),
                 "projected_idx_best": int(out["projected_idx"]) if out["projected_idx"] is not None else None,
                 "topk_projected_idxs": json.dumps(out["topk_idxs"]),
                 "topk_preds": json.dumps(out["topk_preds"]),
                 "topk_losses": json.dumps(out["topk_losses"]),
                 "topk_admet_penalties": json.dumps(out["topk_admet_penalties"]),
-                "topk_manifold_distances": json.dumps(out["topk_manifold_distances"]),
+                "admet_values_best": admet_json,
             }
         )
 
@@ -779,13 +795,17 @@ def retrieve_candidates(
     target_counts_arr = np.array(target_counts, dtype=np.float32)
 
     fingerprint_subset = ligand_mat[:, bucket_array].astype(np.float32, copy=False)
+
     # Heavily weight edited buckets; lightly weight unchanged ones.
-    weights = np.ones_like(target_counts_arr) #* 0.2
-    if len(ligand_adjustments) == len(target_counts_arr):
-        adj = np.asarray(ligand_adjustments, dtype=np.float32)
-        weights = np.where(np.abs(adj) > 0, 2.0 * (1.0 + np.abs(adj)),1)
-    else:
-        weights = np.ones_like(target_counts_arr)
+
+    ligand_adj_arr = np.asarray(ligand_adjustments, dtype=np.float32)
+
+    delta  = np.abs(ligand_adj_arr)
+    # bucket = np.abs(target_counts_arr)
+
+    weights = np.ones_like(delta, dtype=np.float32)
+    # weights[bucket > 0] = 1.0
+    weights[delta  > 0] = (1.0 + 2.0 * delta[delta > 0]).astype(np.float32)
 
     diff_matrix = np.abs(fingerprint_subset - target_counts_arr)
     weighted_diff = diff_matrix * weights
@@ -1009,6 +1029,43 @@ def _parse_vina_score(stdout_text: str, log_path: Path) -> Optional[float]:
     return None
 
 
+def _pick_cand_id(row, idx: int) -> int:
+    di = getattr(row, "dataset_index", None)
+    if di is not None:
+        return int(di)
+    ci = getattr(row, "candidate_id", None)
+    if ci is not None:
+        return int(ci)
+    return int(idx)
+
+
+def _pdbqt_has_cg0(pdbqt_path: Path) -> bool:
+    if not pdbqt_path.exists():
+        return False
+    txt = pdbqt_path.read_text(errors="ignore")
+    return bool(re.search(r"\bCG[0-3]\b|\bG[0-3]\b", txt))
+
+
+def _rerun_meeko_rigid(sdf_path: Path, pdbqt_path: Path) -> None:
+    """
+    Re-run Meeko with --rigid_macrocycles to eliminate CG0/G0 pseudo-atoms.
+    Requires your existing _resolve_meeko().
+    """
+    mk_cli = _resolve_meeko()
+    if pdbqt_path.exists():
+        pdbqt_path.unlink()
+
+    cmd = [mk_cli, "-i", str(sdf_path), "-o", str(pdbqt_path), "--rigid_macrocycles"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or (not pdbqt_path.exists()):
+        raise RuntimeError(
+            "Meeko rigid macrocycles failed.\n"
+            f"cmd={' '.join(cmd)}\n"
+            f"stderr_tail={(r.stderr or '')[-800:]}\n"
+            f"stdout_tail={(r.stdout or '')[-800:]}"
+        )
+
+
 def dock_candidates(
     cfg: DockingConfig,
     step_dir: Path,
@@ -1019,100 +1076,220 @@ def dock_candidates(
     step_dir.mkdir(parents=True, exist_ok=True)
     if not cfg.enabled:
         return {}, {"skipped": True, "reason": "Docking disabled"}
+
     df = pd.read_csv(candidates_csv)
     if df.empty:
         return {}, {"skipped": True, "reason": "No candidates to dock"}
 
+    # baseline row
     if baseline_smiles:
-        extra = {
-            "dataset_index": -1,
-            "smiles": baseline_smiles,
-        }
+        bidx = -1 if baseline_index is None else int(baseline_index)
+        extra = {"dataset_index": bidx, "candidate_id": bidx, "smiles": baseline_smiles}
         df = pd.concat([pd.DataFrame([extra]), df], ignore_index=True)
 
+    # docking box
     center = cfg.center
     size = cfg.size
     if center is None:
         try:
             from dock_with_tdc_box import get_tdc_box_for_target
-
             _, center, size = get_tdc_box_for_target(cfg.target_key)
         except Exception as e:
             raise RuntimeError("Docking box center/size not provided and could not be inferred") from e
 
     cx, cy, cz = center
     sx, sy, sz = size
+
     out_root = step_dir
     out_root.mkdir(parents=True, exist_ok=True)
 
     results = []
-    limit = cfg.limit or len(df)
+
+    # limit: keep your behavior but handle cfg.limit=0 correctly
+    limit = len(df) if cfg.limit is None else int(cfg.limit)
+
     iterator = enumerate(df.itertuples(index=False))
-    try:
-        iterator = tqdm(iterator, total=len(df), desc="[docking] vina")  # type: ignore[arg-type]
-    except Exception:
-        pass
+    if tqdm is not None:
+        iterator = tqdm(iterator, total=len(df), desc="[docking] vina")
+
     for idx, row in iterator:
-        cand_id = getattr(row, "dataset_index", None) or getattr(row, "candidate_id", None) or idx
-        smi = getattr(row, "smiles")
-        cand_dir = out_root / f"cand_{cand_id}"
-        try:
-            sdf_path, lig_pdbqt = _smiles_to_files(smi, cand_dir, base=str(cand_id))
-            docked_pdbqt = cand_dir / f"docked_{cand_id}.pdbqt"
-            log_path = cand_dir / f"vina_{cand_id}.log"
-            cmd = [
-                "vina",
-                "--receptor",
-                str(cfg.receptor_pdbqt),
-                "--ligand",
-                str(lig_pdbqt),
-                "--center_x",
-                str(cx),
-                "--center_y",
-                str(cy),
-                "--center_z",
-                str(cz),
-                "--size_x",
-                str(sx),
-                "--size_y",
-                str(sy),
-                "--size_z",
-                str(sz),
-                "--exhaustiveness",
-                str(cfg.exhaustiveness),
-                "--num_modes",
-                str(cfg.num_modes),
-                "--seed",
-                str(cfg.seed),
-                "--out",
-                str(docked_pdbqt),
-                "--log",
-                str(log_path),
-            ]
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            score = _parse_vina_score(r.stdout, log_path)
-            results.append(
-                {
-                    "candidate_id": cand_id,
-                    "smiles": smi,
-                    "vina_score": score,
-                    "ligand_sdf": str(sdf_path),
-                    "ligand_pdbqt": str(lig_pdbqt),
-                    "docked_pdbqt": str(docked_pdbqt),
-                    "vina_log": str(log_path),
-                    "returncode": r.returncode,
-                    "stderr": r.stderr[:300],
-                }
-            )
-        except Exception as e:
-            results.append({"candidate_id": cand_id, "smiles": smi, "vina_score": None, "error": str(e)})
         if len(results) >= limit:
             break
+
+        cand_id = _pick_cand_id(row, idx)
+        smi = getattr(row, "smiles")
+        cand_dir = out_root / f"cand_{cand_id}"
+        cand_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # --- ligand prep ---
+            sdf_path, lig_pdbqt = _smiles_to_files(smi, cand_dir, base=str(cand_id))
+
+            # --- CRITICAL FIX: if Meeko produced CG0/G0, rerun rigid before Vina ---
+            if _pdbqt_has_cg0(Path(lig_pdbqt)):
+                _rerun_meeko_rigid(Path(sdf_path), Path(lig_pdbqt))
+
+            # --- run vina ---
+            docked_pdbqt = cand_dir / f"docked_{cand_id}.pdbqt"
+            log_path = cand_dir / f"vina_{cand_id}.log"
+
+            cmd = [
+                "vina",
+                "--receptor", str(cfg.receptor_pdbqt),
+                "--ligand", str(lig_pdbqt),
+                "--center_x", str(cx), "--center_y", str(cy), "--center_z", str(cz),
+                "--size_x", str(sx), "--size_y", str(sy), "--size_z", str(sz),
+                "--exhaustiveness", str(cfg.exhaustiveness),
+                "--num_modes", str(cfg.num_modes),
+                "--seed", str(cfg.seed),
+                "--cpu", str(getattr(cfg, "cpu", 8)),  # add cpu if your cfg has it
+                "--out", str(docked_pdbqt),
+                "--log", str(log_path),
+            ]
+
+            r = subprocess.run(cmd, capture_output=True, text=True)
+
+            # If vina fails, surface the real message (don’t silently NaN)
+            if r.returncode != 0:
+                raise RuntimeError(
+                    f"vina failed (returncode={r.returncode}). "
+                    f"stderr_tail={(r.stderr or '')[-800:]}"
+                )
+
+            score = _parse_vina_score(r.stdout, log_path)
+
+            results.append({
+                "candidate_id": cand_id,
+                "smiles": smi,
+                "vina_score": score,
+                "ligand_sdf": str(sdf_path),
+                "ligand_pdbqt": str(lig_pdbqt),
+                "docked_pdbqt": str(docked_pdbqt),
+                "vina_log": str(log_path),
+                "returncode": r.returncode,
+                "stderr": (r.stderr or "")[:300],
+            })
+
+        except Exception as e:
+            results.append({
+                "candidate_id": cand_id,
+                "smiles": smi,
+                "vina_score": None,
+                "error": str(e),
+            })
 
     summary_df = pd.DataFrame(results)
     summary_path = step_dir / "docking_scores.csv"
     summary_df.to_csv(summary_path, index=False)
+
     return {"docking": summary_path}, {"docked": int(summary_df["vina_score"].notna().sum())}
+
+
+
+# def dock_candidates(
+#     cfg: DockingConfig,
+#     step_dir: Path,
+#     candidates_csv: Path,
+#     baseline_smiles: Optional[str] = None,
+#     baseline_index: Optional[int] = None,
+# ) -> StepOutputs:
+#     step_dir.mkdir(parents=True, exist_ok=True)
+#     if not cfg.enabled:
+#         return {}, {"skipped": True, "reason": "Docking disabled"}
+#     df = pd.read_csv(candidates_csv)
+#     if df.empty:
+#         return {}, {"skipped": True, "reason": "No candidates to dock"}
+
+#     if baseline_smiles:
+#         extra = {
+#             "dataset_index": -1,
+#             "smiles": baseline_smiles,
+#         }
+#         df = pd.concat([pd.DataFrame([extra]), df], ignore_index=True)
+
+#     center = cfg.center
+#     size = cfg.size
+#     if center is None:
+#         try:
+#             from dock_with_tdc_box import get_tdc_box_for_target
+
+#             _, center, size = get_tdc_box_for_target(cfg.target_key)
+#         except Exception as e:
+#             raise RuntimeError("Docking box center/size not provided and could not be inferred") from e
+
+#     cx, cy, cz = center
+#     sx, sy, sz = size
+#     out_root = step_dir
+#     out_root.mkdir(parents=True, exist_ok=True)
+
+#     results = []
+#     limit = cfg.limit or len(df)
+#     iterator = enumerate(df.itertuples(index=False))
+#     try:
+#         iterator = tqdm(iterator, total=len(df), desc="[docking] vina")  # type: ignore[arg-type]
+#     except Exception:
+#         pass
+#     for idx, row in iterator:
+#         cand_id = getattr(row, "dataset_index", None) or getattr(row, "candidate_id", None) or idx
+#         smi = getattr(row, "smiles")
+#         cand_dir = out_root / f"cand_{cand_id}"
+#         try:
+#             sdf_path, lig_pdbqt = _smiles_to_files(smi, cand_dir, base=str(cand_id))
+#             docked_pdbqt = cand_dir / f"docked_{cand_id}.pdbqt"
+#             log_path = cand_dir / f"vina_{cand_id}.log"
+#             cmd = [
+#                 "vina",
+#                 "--receptor",
+#                 str(cfg.receptor_pdbqt),
+#                 "--ligand",
+#                 str(lig_pdbqt),
+#                 "--center_x",
+#                 str(cx),
+#                 "--center_y",
+#                 str(cy),
+#                 "--center_z",
+#                 str(cz),
+#                 "--size_x",
+#                 str(sx),
+#                 "--size_y",
+#                 str(sy),
+#                 "--size_z",
+#                 str(sz),
+#                 "--exhaustiveness",
+#                 str(cfg.exhaustiveness),
+#                 "--num_modes",
+#                 str(cfg.num_modes),
+#                 "--seed",
+#                 str(cfg.seed),
+#                 "--out",
+#                 str(docked_pdbqt),
+#                 "--log",
+#                 str(log_path),
+#             ]
+#             r = subprocess.run(cmd, capture_output=True, text=True)
+#             score = _parse_vina_score(r.stdout, log_path)
+#             results.append(
+#                 {
+#                     "candidate_id": cand_id,
+#                     "smiles": smi,
+#                     "vina_score": score,
+#                     "ligand_sdf": str(sdf_path),
+#                     "ligand_pdbqt": str(lig_pdbqt),
+#                     "docked_pdbqt": str(docked_pdbqt),
+#                     "vina_log": str(log_path),
+#                     "returncode": r.returncode,
+#                     "stderr": r.stderr[:300],
+#                 }
+#             )
+#         except Exception as e:
+#             results.append({"candidate_id": cand_id, "smiles": smi, "vina_score": None, "error": str(e)})
+#         if len(results) >= limit:
+#             break
+
+#     summary_df = pd.DataFrame(results)
+#     summary_path = step_dir / "docking_scores.csv"
+#     summary_df.to_csv(summary_path, index=False)
+#     return {"docking": summary_path}, {"docked": int(summary_df["vina_score"].notna().sum())}
 
 
 # ------------------------------ ADMET ------------------------------ #
