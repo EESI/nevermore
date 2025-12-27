@@ -7,6 +7,8 @@ data:
   data_dir: data
   optimization_db: train.csv 
   retrieval_db: chembl36_id_smiles.tsv 
+  # retrieval_db: AID_1768_datatable_all_just_smiles.csv
+
 
 
 features:
@@ -31,16 +33,16 @@ optimization:
   allow_ligand_adjustments: true
   frozen_protein_features: []
   frozen_ligand_features: []
-  budget: 150
-  beta: 0.1             # weight for ADMET penalty term
+  budget: 200
+  beta: 1            # weight for ADMET penalty term
   manifold_weight: 0
   target_sequence: null     # optional override instead of dataset index
   baseline_smiles: null     # optional override instead of dataset index
-  admet_constraints:   #[]
-      - {key: hERG, max: 0.1, weight: 1.0}            # ADMET-AI: predicted probability of hERG blockade (cardiotoxicity liability). Lower is safer; keep ≤0.2.
-      - {key: logP, min: 0.5, max: 3.5, weight: 1.0}  # ADMET-AI logP (lipophilicity). 0.5–3.5 balances permeability vs solubility/clearance; too high increases ADME/tox risks.
-      - {key: molecular_weight, max: 500, weight: 1} # ADMET-AI MW in Da. ≤500 supports oral exposure and reduces permeability/solubility penalties; >500 often harder ADME.
-      - {key: QED, min: 0.5, weight: 1.0}             # ADMET-AI QED (0–1 drug-likeness). ≥0.6 pushes toward well-balanced “drug-like” structures.
+  admet_constraints:   
+      - {key: hERG, max: 0.2, weight: 1.0}            # ADMET-AI: predicted probability of hERG blockade (cardiotoxicity liability). Lower is safer; keep ≤0.2.
+      - {key: logP, min: 1, max: 3.5, weight: 1}  # ADMET-AI logP (lipophilicity). 0.5–3.5 balances permeability vs solubility/clearance; too high increases ADME/tox risks.
+      - {key: molecular_weight, max: 500, min: 300, weight: 0.01} # ADMET-AI MW in Da. ≤500 supports oral exposure and reduces permeability/solubility penalties; >500 often harder ADME.
+      - {key: QED, min: 0.5, weight: 1}             # ADMET-AI QED (0–1 drug-likeness). ≥0.6 pushes toward well-balanced “drug-like” structures.
       - {key: HIA_Hou, min: 0.7, weight: 1}         # ADMET-AI HIA (Hou) predicted probability of good human intestinal absorption. ≥0.7 favors oral absorption.
       - {key: Lipinski, min: 3, weight: 1}          # ADMET-AI Lipinski count (0–4 rules satisfied). ≥3 is a solid filter; 4 is ideal if you can enforce it.
 
@@ -65,12 +67,12 @@ docking:
   target_key: 3U84
   receptor_pdbqt: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/3U84.pdbqt
   out_root: null            # defaults to nevermore/outputs/docking/<signature>
-  exhaustiveness: 32
-  num_modes: 20
+  exhaustiveness: 5
+  num_modes: 5
   seed: 42
   limit: null               # set int to cap ligands
   center: [15, -64, 1]              # supply [x, y, z] to override TDC metadata
-  size: [30.0, 30.0, 30.0]
+  size: [34.0, 34.0, 34.0]
 
 
 report:

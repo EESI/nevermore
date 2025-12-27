@@ -838,6 +838,70 @@ def retrieve_candidates(
     # sort candidates by distance (closest first)
     order = np.argsort(distance)  # ascending
 
+
+    ##########################
+    # print("fucking ")
+    # rng = np.random.default_rng(43)
+    # order = rng.permutation(len(processed))
+
+
+    #########################
+
+    # from rdkit import Chem, DataStructs
+    # from rdkit.Chem import AllChem
+
+    # radius, nBits = 3, 1024
+
+    # base = Chem.MolFromSmiles(baseline_smiles)
+    # if base is None:
+    #     raise ValueError("Invalid baseline_smiles")
+    # base_fp = AllChem.GetMorganFingerprintAsBitVect(base, radius, nBits=nBits)
+
+    # fps, idxs = [], []
+    # for i, smi in enumerate(processed["smiles"].astype(str).tolist()):
+    #     m = Chem.MolFromSmiles(smi)
+    #     if m is None:
+    #         continue
+    #     fps.append(AllChem.GetMorganFingerprintAsBitVect(m, radius, nBits=nBits))
+    #     idxs.append(i)
+
+    # sims = DataStructs.BulkTanimotoSimilarity(base_fp, fps)   # higher = closer
+    # order = np.array(idxs)[np.argsort(-np.array(sims, dtype=np.float32))]
+
+    #################
+    # ABLATION: Morgan-Tversky similarity (asymmetric) vs baseline_smiles
+
+    # from rdkit import Chem, DataStructs
+    # from rdkit.Chem import RDKFingerprint
+    # from tqdm import tqdm
+
+    # fpSize = 1024
+    # alpha, beta = 0.2, 0.8  # try also (0.8, 0.2)
+
+    # base = Chem.MolFromSmiles(baseline_smiles)
+    # if base is None:
+    #     raise ValueError(f"Invalid baseline_smiles: {baseline_smiles}")
+
+    # base_fp = RDKFingerprint(base, fpSize=fpSize)
+
+    # smiles_list = processed["smiles"].astype(str).tolist()
+
+    # fps, idxs = [], []
+    # for i, smi in tqdm(list(enumerate(smiles_list)), total=len(smiles_list), desc="RDKFP"):
+    #     m = Chem.MolFromSmiles(smi)
+    #     if m is None:
+    #         continue
+    #     fps.append(RDKFingerprint(m, fpSize=fpSize))
+    #     idxs.append(i)
+
+    # sims = np.empty(len(fps), dtype=np.float32)
+    # for j, fp in enumerate(fps):
+    #     sims[j] = DataStructs.TverskySimilarity(base_fp, fp, alpha, beta)
+
+    # order = np.asarray(idxs, dtype=int)[np.argsort(-sims)]  # highest similarity first
+
+
+
     for idx in order:
         dist_i = float(distance[idx])
         row = processed.iloc[idx]
