@@ -1,6 +1,0 @@
-# Bytecode/cache artifacts
-__pycache__/
-*.py[cod]
-
-# Ignore notebooks within this package
-*.ipynb

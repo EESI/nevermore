@@ -608,7 +608,18 @@ def run_optimization(
             return np.nan if math.isnan(f) else f
 
         out = evaluate(delta, include_rep_penalty=False)
-        admet_vals = out.get("admet_vals") or {}
+        
+        # admet_vals = out.get("admet_vals") or {}
+        # --- use AVG ADMET over top-K neighbors instead of best ---
+        admet_vals = {}
+        if admet_array is not None and out.get("topk_idxs") and admet_keys:
+            mat = np.stack([admet_array[int(i)] for i in out["topk_idxs"]], axis=0).astype(np.float32)  # (K, D)
+            means = np.nanmean(mat, axis=0)  # ignore NaNs
+            admet_vals = {
+                k: (float(means[j]) if not np.isnan(means[j]) else np.nan)
+                for j, k in enumerate(admet_keys)
+            }
+
         clean_admet_vals = {k: _safe_float(v) for k, v in admet_vals.items()}
         admet_cols = {f"admet_{k}": clean_admet_vals.get(k, np.nan) for k in admet_keys} if admet_keys else {}
         admet_json = (
