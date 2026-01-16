@@ -2,6 +2,7 @@
 
 Modular, cached version of the Nevermore notebook that chains data ingest, feature building, optimization, retrieval, visualization, docking, ADMET, and reporting. Each step writes to `nevermore/outputs/<step>/<signature>/` and is skipped automatically if inputs/configs are unchanged.
 
+
 ## Layout
 - `nevermore/configs/default.yaml` — editable defaults for every stage.
 - `nevermore/` — pipeline + step implementations.
