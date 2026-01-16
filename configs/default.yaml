@@ -1,0 +1,78 @@
+run_name: nevermore-demo2
+paths:
+  repo_root: null           # auto-detected; leave null unless running elsewhere
+  output_root: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/pipeline_output    # writes to <repo>/outputs
+
+data:
+  data_dir: data
+  optimization_db: train.csv 
+  retrieval_db: chembl36_id_smiles.tsv 
+
+
+
+features:
+  protein_encoder: esm       # "esm" to use ESM tokens, "handcrafted" for unigram/bigram counts
+  esm_model: facebook/esm2_t12_35M_UR50D
+  max_token_length: 1500
+  skip_protein_features: true   # skip protein featurization to speed up ingestion/feature build
+  morgan_bits: 1024
+  morgan_radius: 3
+  checkpoint: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/output/esm_morgan_trainer/final/checkpoint.pt
+  batch_size: 64
+  device: "cuda:7"              # "cuda" | "cpu" | null (auto)
+  admet_in_features: true   # compute ADMET during feature build (requires admet-ai)
+  admet_keys: [molecular_weight, logP, HIA_Hou, hERG, QED, Lipinski]
+
+optimization:
+  protein_features: 0
+  ligand_features: 70
+  allow_protein_adjustments: false
+  allow_ligand_adjustments: true
+  frozen_protein_features: []
+  frozen_ligand_features: []
+  nn_k: 10           # number of nearest neighbors for manifold projection
+  budget: 300       # max number of nevergrad iterations
+  beta: 1          # weight for ADMET penalty term
+  manifold_weight: 0
+  target_sequence: null     # baseline Target sequence;
+  baseline_smiles: null     # baseline Drug smile;
+  target_affinity: 12.0
+  admet_constraints:   
+      - {key: hERG, max: 0.2, weight: 1.0}            # ADMET-AI: predicted probability of hERG blockade (cardiotoxicity liability). Lower is safer; keep ≤0.2.
+      - {key: logP, min: 1, max: 3.5, weight: 1}  # ADMET-AI logP (lipophilicity). 0.5–3.5 balances permeability vs solubility/clearance; too high increases ADME/tox risks.
+      - {key: molecular_weight, max: 500, min: 300, weight: 0.01} # ADMET-AI MW in Da. ≤500 supports oral exposure and reduces permeability/solubility penalties; >500 often harder ADME.
+      - {key: QED, min: 0.5, weight: 1}             # ADMET-AI QED (0–1 drug-likeness). ≥0.6 pushes toward well-balanced “drug-like” structures.
+      - {key: HIA_Hou, min: 0.7, weight: 1}         # ADMET-AI HIA (Hou) predicted probability of good human intestinal absorption. ≥0.7 favors oral absorption.
+      - {key: Lipinski, min: 3, weight: 1}          # ADMET-AI Lipinski count (0–4 rules satisfied). ≥3 is a solid filter; 4 is ideal if you can enforce it.
+
+
+retrieval:
+  max_rel_smiles_len_diff: 1
+  max_rel_mw_diff: 1
+  max_l1_distance: null
+  top_candidates: 100
+
+visualization:
+  enabled: False
+  max_mols: 40
+  mols_per_row: 6
+  panel_size: [300, 240]
+  id_col: dataset_index
+  out_svg: candidate_ligands_grid.svg
+  out_png: candidate_ligands_grid.png
+
+docking:
+  enabled: False
+  target_key: 3U84
+  receptor_pdbqt: /scratch/home/sr3622/Firm-DTI/Firm-DTI2/3U84.pdbqt
+  out_root: null            # defaults to nevermore/outputs/docking/<signature>
+  exhaustiveness: 5
+  num_modes: 5
+  seed: 42
+  limit: null               # set int to cap ligands
+  center: [15, -64, 1]              # supply [x, y, z] to override TDC metadata
+  size: [34.0, 34.0, 34.0]
+
+
+report:
+  enabled: true
