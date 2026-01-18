@@ -1,9 +1,8 @@
 # Nevermore Pipeline
 
 Nevermore is a **target-conditioned, closed-loop framework for ligand optimization** that combines (1) a protein–ligand **binding-affinity oracle**, (2) **derivative-free multi-objective optimization** in a learned representation/descriptor space, and (3) **database-grounded retrieval** to keep proposed molecules anchored to valid chemical matter. This repository implements the end-to-end experimental workflow described in the JCIM manuscript: **data ingest → feature building → optimization → retrieval → visualization → (optional) docking → (optional) ADMET → reporting**.
-
 The codebase is **modular and cached** for reproducibility and efficient iteration. Each stage writes its artifacts to  
-`nevermore/outputs/<step>/<signature>/` and is automatically **skipped** when inputs and configuration are unchanged. Signatures are derived deterministically from the stage configuration and upstream artifacts; changing any config value or upstream file produces a new signature and a new output directory.
+`nevermore/outputs/<step>/<signature>/` and is automatically **skipped** when inputs and configuration are unchanged. 
 
 ## Layout
 - `nevermore/configs/default.yaml` — editable defaults for every stage (targets, checkpoints, retrieval settings, etc.).
