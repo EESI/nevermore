@@ -10,7 +10,7 @@ Modular, cached version of the Nevermore notebook that chains data ingest, featu
 
 ## Quick start
 ```bash
-# from Firm-DTI/Firm-DTI2
+
 python -m nevermore.cli --config nevermore/configs/default.yaml --up-to retrieval
 ```
 Change `--up-to` to run deeper (visualization, docking, admet, report). Outputs are printed with their cache signature.
@@ -29,4 +29,3 @@ You can edit `nevermore/configs/default.yaml` directly to change the checkpoint,
 ## Notes
 - Docking and ADMET are disabled by default; flip `enabled: true` in the config to run them.
 - Retrieval reuses previous steps when inputs match. Change any config value or upstream file to force a new signature/output set.
-- The pipeline assumes the Firm-DTI2 repo root contains `data/train.csv` and the checkpoint from the original notebook. Adjust paths in the config if yours differ.
