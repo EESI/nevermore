@@ -6,7 +6,7 @@ The codebase is **modular and cached** for reproducibility and efficient iterati
 `nevermore/outputs/<step>/<signature>/` and is automatically **skipped** when inputs and configuration are unchanged. Signatures are derived deterministically from the stage configuration and upstream artifacts; changing any config value or upstream file produces a new signature and a new output directory.
 
 ## Layout
-- `nevermore/configs/default.yaml` — editable defaults for every stage (targets, checkpoints, retrieval settings, optimization objectives, etc.).
+- `nevermore/configs/default.yaml` — editable defaults for every stage (targets, checkpoints, retrieval settings, etc.).
 - `nevermore/` — pipeline implementation and stage modules.
 - `nevermore/notebooks/run_nevermore.ipynb` — notebook entrypoint (optional; everything is runnable via CLI).
 
